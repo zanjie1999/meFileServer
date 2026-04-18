@@ -1897,7 +1897,7 @@ def prompt_password() -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="咩FileServer：单文件脚本的目录化断点续传文件服务器")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认：%(default)s")
-    parser.add_argument("--port", type=int, default=8000, help="监听端口，默认：%(default)s")
+    parser.add_argument("--port", type=int, default=10000, help="监听端口，默认：%(default)s")
     parser.add_argument("--root", default=".", help="共享根目录，默认：当前目录")
     return parser
 
