@@ -37,7 +37,7 @@ HOME_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>meFileServer</title>
+  <title>咩FileServer</title>
   <style>
     :root {
       color-scheme: light;
@@ -350,9 +350,9 @@ HOME_PAGE = """<!doctype html>
 <body>
   <main>
     <section class="panel hero">
-      <h1>meFileServer</h1>
+      <h1>咩FileServer</h1>
       <p>当前共享根目录：<code>__ROOT__</code></p>
-      <p>单文件简易文件服务器 支持文件目录断点续传上传下载</p>
+      <p>单文件文件服务器 支持文件目录断点续传上传下载</p>
       <p>哔哩哔哩：<a href="https://space.bilibili.com/9992930" target="_blank">郑羊羊</a> | 项目开源：<a href="https://github.com/zanjie1999/meFileServer" target="_blank">GitHub</a></p>
     </section>
 
