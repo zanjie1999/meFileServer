@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # 咩FileServer
-# zyyme 20260419 v2.2
+# zyyme 20260419
 
 import argparse
 import datetime as dt
@@ -27,6 +27,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 
+VER = "v2.2"
 SIDECAR_SUFFIX = ".mefs"
 UPLOAD_READ_CHUNK = 64 * 1024
 PROGRESS_FLUSH_BYTES = 1024 * 1024
@@ -183,6 +184,7 @@ HOME_PAGE = """<!doctype html>
       margin-top: 14px;
       display: grid;
       gap: 10px;
+      overflow: scroll;
     }
     .progress-block {
       display: grid;
@@ -295,6 +297,10 @@ HOME_PAGE = """<!doctype html>
       white-space: nowrap;
       text-decoration: none;
     }
+    p a {
+      color: var(--accent);
+      text-decoration: none;
+    }
     .entry-name {
       border: 0;
       background: transparent;
@@ -389,7 +395,7 @@ HOME_PAGE = """<!doctype html>
         <code id="upload-target-path">/</code>
         <button id="reset-upload-target-btn" type="button" class="light">切回根目录</button>
       </div>
-      <div class="hint">文件夹上传和下载依赖Chromium的目录访问API和HTTPS，建议使用Google Chrome浏览器或者Microsoft Edge浏览器</div>
+      <div class="hint">文件夹上传和下载依赖Chromium的目录访问API和https</div>
       <div id="status" class="status">等待上传</div>
       <div class="progress-group">
         <div class="progress-block">
@@ -2940,7 +2946,7 @@ def serve_servers(servers: list[MeFileHTTPServer]) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="咩FileServer：单文件脚本的目录化断点续传文件服务器")
+    parser = argparse.ArgumentParser(description="咩FileServer " + VER + " https://github.com/zanjie1999/meFileServer")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认：%(default)s")
     parser.add_argument("--port", type=int, default=10000, help="监听端口，默认：%(default)s")
     parser.add_argument("--root", default=".", help="共享根目录，默认：当前目录")
@@ -2952,6 +2958,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    print(f"咩FileServer {VER}")
 
     root = Path(args.root).resolve()
     if not root.exists() or not root.is_dir():
