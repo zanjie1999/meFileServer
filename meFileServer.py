@@ -2575,7 +2575,7 @@ def render_login_page(message: str) -> str:
 
 def prompt_password() -> str:
     try:
-        return getpass.getpass("共享访问密码（直接回车就不用密码，输入的密码不会显示）：")
+        return input("共享访问密码（直接回车就不用密码）：")
     except EOFError:
         print("\n当前环境无法交互输入密码，将以无鉴权模式启动", file=sys.stderr)
         return ""
