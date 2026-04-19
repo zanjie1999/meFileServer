@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -1555,6 +1556,18 @@ class MeFileHTTPServer(ThreadingHTTPServer):
         self.state = state
 
 
+class MeFileHTTPServerIPv6(MeFileHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
 def utc_now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -2368,11 +2381,138 @@ def prompt_password() -> str:
         return ""
 
 
+def resolve_password(args: argparse.Namespace) -> str:
+    if getattr(args, "nopwd", False):
+        return ""
+    if getattr(args, "pwd", None) is not None:
+        return args.pwd
+    return prompt_password()
+
+
+def normalize_socket_host(family: int, sockaddr: Any) -> str:
+    if family == socket.AF_INET6:
+        try:
+            return socket.getnameinfo(sockaddr, socket.NI_NUMERICHOST)[0]
+        except OSError:
+            return str(sockaddr[0])
+    return str(sockaddr[0])
+
+
+def is_listable_address(family: int, host: str) -> bool:
+    if not host:
+        return False
+    value = host.strip()
+    if not value:
+        return False
+    if family == socket.AF_INET:
+        return value not in {"0.0.0.0", "127.0.0.1"}
+    if family == socket.AF_INET6:
+        return value.split("%", 1)[0] not in {"::", "::1"}
+    return False
+
+
+def probe_default_route_address(family: int) -> str | None:
+    targets: dict[int, Any] = {
+        socket.AF_INET: ("8.8.8.8", 80),
+    }
+    if hasattr(socket, "AF_INET6"):
+        targets[socket.AF_INET6] = ("2001:4860:4860::8888", 80, 0, 0)
+    target = targets.get(family)
+    if not target:
+        return None
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.connect(target)
+            return normalize_socket_host(family, sock.getsockname())
+    except OSError:
+        return None
+
+
+def collect_local_addresses(*, include_ipv6: bool) -> list[tuple[int, str]]:
+    families = [socket.AF_INET]
+    if include_ipv6 and hasattr(socket, "AF_INET6"):
+        families.append(socket.AF_INET6)
+
+    addresses: set[tuple[int, str]] = set()
+    hostname = socket.gethostname()
+    for family in families:
+        try:
+            infos = socket.getaddrinfo(hostname, None, family, socket.SOCK_DGRAM)
+        except OSError:
+            infos = []
+        for info_family, _, _, _, sockaddr in infos:
+            host = normalize_socket_host(info_family, sockaddr)
+            if is_listable_address(info_family, host):
+                addresses.add((info_family, host))
+
+        probed_host = probe_default_route_address(family)
+        if probed_host and is_listable_address(family, probed_host):
+            addresses.add((family, probed_host))
+
+    return sorted(addresses, key=lambda item: (0 if item[0] == socket.AF_INET else 1, item[1]))
+
+
+def format_access_url(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host.replace('%', '%25')}]:{port}"
+    return f"http://{host}:{port}"
+
+
+def build_access_urls(host: str, port: int, *, ipv6_enabled: bool) -> list[str]:
+    if host != "0.0.0.0":
+        return [format_access_url(host, port)]
+
+    urls = [format_access_url(address, port) for _, address in collect_local_addresses(include_ipv6=ipv6_enabled)]
+    if urls:
+        return urls
+
+    fallback_urls = [format_access_url("127.0.0.1", port)]
+    if ipv6_enabled:
+        fallback_urls.append(format_access_url("::1", port))
+    return fallback_urls
+
+
+def create_servers(host: str, port: int, state: AppState) -> tuple[list[MeFileHTTPServer], str | None]:
+    servers: list[MeFileHTTPServer] = [MeFileHTTPServer((host, port), RequestHandler, state)]
+    ipv6_notice: str | None = None
+
+    if host == "0.0.0.0" and hasattr(socket, "AF_INET6"):
+        try:
+            servers.append(MeFileHTTPServerIPv6(("::", port), RequestHandler, state))
+        except OSError as exc:
+            ipv6_notice = f"提示：IPv6 未启用：{exc}"
+
+    return servers, ipv6_notice
+
+
+def serve_servers(servers: list[MeFileHTTPServer]) -> None:
+    threads: list[threading.Thread] = []
+    try:
+        for index, server in enumerate(servers):
+            thread = threading.Thread(target=server.serve_forever, name=f"mefileserver-{index}", daemon=True)
+            thread.start()
+            threads.append(thread)
+        while True:
+            time.sleep(1)
+    finally:
+        for server in servers:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+        for server in servers:
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="咩FileServer：单文件脚本的目录化断点续传文件服务器")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认：%(default)s")
     parser.add_argument("--port", type=int, default=10000, help="监听端口，默认：%(default)s")
     parser.add_argument("--root", default=".", help="共享根目录，默认：当前目录")
+    parser.add_argument("--pwd", help="访问密码，默认在启动时询问")
+    parser.add_argument("--nopwd", action="store_true", help="不启用密码")
     return parser
 
 
@@ -2384,19 +2524,24 @@ def main() -> int:
     if not root.exists() or not root.is_dir():
         parser.error(f"共享根目录不存在，或者它不是一个目录：{root}")
 
-    password = prompt_password()
+    password = resolve_password(args)
     state = AppState(root=root, password=password)
-    server = MeFileHTTPServer((args.host, args.port), RequestHandler, state)
+    servers, ipv6_notice = create_servers(args.host, args.port, state)
+    ipv6_enabled = any(getattr(server, "address_family", None) == getattr(socket, "AF_INET6", object()) for server in servers)
+    access_urls = build_access_urls(args.host, args.port, ipv6_enabled=ipv6_enabled)
 
     auth_note = "已启用密码" if password else "未启用密码"
     print(f"咩FileServer 已启动：{root}")
-    print(f"访问地址：http://{args.host}:{args.port}")
+    print(f"密码状态：{auth_note}")
+    if ipv6_notice:
+        print(ipv6_notice)
+    print("可访问地址：")
+    for url in access_urls:
+        print(f"  {url}")
     try:
-        server.serve_forever()
+        serve_servers(servers)
     except KeyboardInterrupt:
         print("\n正在关闭 咩FileServer")
-    finally:
-        server.server_close()
     return 0
 
 
