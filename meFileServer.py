@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 # 咩FileServer
-# zyyme 20260419 v2.0
+# zyyme 20260419 v2.1
 
 import argparse
 import datetime as dt
+import errno
 import getpass
 import html
 import json
@@ -12,6 +13,7 @@ import mimetypes
 import os
 import secrets
 import socket
+import stat
 import sys
 import threading
 import time
@@ -310,6 +312,23 @@ HOME_PAGE = """<!doctype html>
       gap: 8px;
       align-items: center;
       flex-wrap: nowrap;
+      margin-left: auto;
+      flex: 0 0 auto;
+    }
+    .entry-action-button {
+      padding: 7px 12px;
+      font-size: 0.88rem;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    .entry-action-button.danger {
+      background: #fff1ef;
+      color: var(--danger);
+      border: 1px solid #f0c6c1;
+    }
+    .entry-action-button.danger:hover {
+      filter: none;
+      background: #ffd9d5;
     }
     .badge {
       padding: 3px 8px;
@@ -601,11 +620,13 @@ HOME_PAGE = """<!doctype html>
       uploadToCurrentButton.textContent = currentBrowsePath === currentUploadPath ? "当前上传目录" : "切换上传目录";
     }
 
-    function setUploadTarget(path) {
+    function setUploadTarget(path, { silent = false } = {}) {
       currentUploadPath = path || "";
       updateUploadTargetView();
       updateBrowseControls();
-      setStatus(`将上传到：${getDisplayPath(currentUploadPath)}`);
+      if (!silent) {
+        setStatus(`将上传到：${getDisplayPath(currentUploadPath)}`);
+      }
     }
 
     function updateProgressBar(node, value, total) {
@@ -732,6 +753,13 @@ HOME_PAGE = """<!doctype html>
       directoryCache.clear();
     }
 
+    function isSameOrChildPath(path, parentPath) {
+      if (!path || !parentPath) {
+        return path === parentPath;
+      }
+      return path === parentPath || path.startsWith(`${parentPath}/`);
+    }
+
     async function fetchDirectoryListing(path = "", { force = false } = {}) {
       const cacheKey = path || "";
       if (!force && directoryCache.has(cacheKey)) {
@@ -759,6 +787,70 @@ HOME_PAGE = """<!doctype html>
 
     function createMetaText(parts) {
       return parts.filter(Boolean).join(" | ");
+    }
+
+    function createEntryActionButton(label, className, onActivate) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `entry-action-button ${className}`.trim();
+      button.textContent = label;
+      button.disabled = busy;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (busy) {
+          return;
+        }
+        onActivate();
+      });
+      button.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+      });
+      return button;
+    }
+
+    async function deleteEntry(entry) {
+      const isDirectory = entry.type === "目录";
+      const confirmMessage = isDirectory
+        ? `确认删除文件夹「${entry.name}」及其全部内容？`
+        : `确认删除文件「${entry.name}」？`;
+      if (!window.confirm(confirmMessage)) {
+        return;
+      }
+
+      setBusyState(true);
+      try {
+        const { response, payload } = await fetchJson("/api/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: entry.path }),
+        });
+        if (!response.ok) {
+          throw new Error(payload.message || `删除失败：${response.status}`);
+        }
+
+        clearDirectoryCache();
+        if (isSameOrChildPath(currentUploadPath, entry.path)) {
+          setUploadTarget(currentBrowsePath, { silent: true });
+        }
+        await refreshCurrentDirectory({ force: true, silent: true });
+        setStatus(payload.message || `${entry.name} 已删除`);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusyState(false);
+      }
+    }
+
+    function appendDeleteAction(row, entry) {
+      const actions = document.createElement("div");
+      actions.className = "entry-actions";
+      actions.appendChild(createEntryActionButton("删除", "danger", () => {
+        deleteEntry(entry).catch((error) => {
+          setStatus(error.message || String(error), true);
+        });
+      }));
+      row.appendChild(actions);
     }
 
     function renderBreadcrumb(directory) {
@@ -833,9 +925,18 @@ HOME_PAGE = """<!doctype html>
       const text = document.createElement("div");
       text.className = "entry-text";
 
-      const title = document.createElement("span");
-      title.className = "entry-title";
+      const title = document.createElement("a");
+      title.className = "entry-title entry-link";
       title.textContent = entry.name;
+      title.href = entry.preview_url || entry.download_url;
+      title.target = "_blank";
+      title.rel = "noopener noreferrer";
+      title.addEventListener("click", (event) => {
+        event.stopPropagation();
+      });
+      title.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+      });
 
       const meta = document.createElement("div");
       meta.className = "meta";
@@ -849,6 +950,7 @@ HOME_PAGE = """<!doctype html>
       main.appendChild(badge);
       main.appendChild(text);
       row.appendChild(main);
+      appendDeleteAction(row, entry);
       return row;
     }
 
@@ -908,6 +1010,7 @@ HOME_PAGE = """<!doctype html>
       main.appendChild(badge);
       main.appendChild(text);
       row.appendChild(main);
+      appendDeleteAction(row, entry);
       return row;
     }
 
@@ -1648,10 +1751,32 @@ def atomic_write_sidecar(file_path: Path, *, size: int, mtime_ms: int, received:
 
 
 def remove_sidecar(file_path: Path) -> None:
-    try:
-        sidecar_path(file_path).unlink()
-    except FileNotFoundError:
-        pass
+    for candidate in (sidecar_path(file_path), sidecar_temp_path(file_path)):
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def delete_file_path(file_path: Path) -> None:
+    file_path.unlink()
+    remove_sidecar(file_path)
+
+
+def is_real_directory(path: Path) -> bool:
+    return stat.S_ISDIR(path.lstat().st_mode)
+
+
+def delete_directory_tree(dir_path: Path) -> None:
+    for entry in dir_path.iterdir():
+        try:
+            if is_real_directory(entry):
+                delete_directory_tree(entry)
+            else:
+                entry.unlink()
+        except FileNotFoundError:
+            continue
+    dir_path.rmdir()
 
 
 def load_sidecar(file_path: Path) -> dict[str, Any] | None:
@@ -1765,6 +1890,10 @@ def build_download_url(relative_path: str) -> str:
     return "/download?path=" + quote(relative_path, safe="")
 
 
+def build_preview_url(relative_path: str) -> str:
+    return "/download?path=" + quote(relative_path, safe="") + "&inline=1"
+
+
 def relative_path_from_base(full_path: str, base_path: str) -> str:
     if not base_path:
         return full_path
@@ -1814,6 +1943,7 @@ def list_directory(root: Path, current_path: str = "") -> dict[str, Any]:
                         "size": entry_stat.st_size,
                         "mtime": int(entry_stat.st_mtime * 1000),
                         "download_url": build_download_url(entry_path),
+                        "preview_url": build_preview_url(entry_path),
                     }
                 )
         except OSError:
@@ -1857,6 +1987,7 @@ def collect_recursive_directory_listing(root: Path, current_path: str = "") -> d
                             "size": entry_stat.st_size,
                             "mtime": int(entry_stat.st_mtime * 1000),
                             "download_url": build_download_url(entry_path),
+                            "preview_url": build_preview_url(entry_path),
                         }
                     )
             except OSError:
@@ -1966,6 +2097,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not self.ensure_authenticated(api=True):
                     return
                 self.handle_upload(parsed.query)
+                return
+
+            if parsed.path == "/api/delete":
+                if not self.ensure_authenticated(api=True):
+                    return
+                self.handle_delete()
                 return
 
             self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应接口")
@@ -2153,6 +2290,64 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self.send_json(HTTPStatus.OK, response)
 
+    def handle_delete(self) -> None:
+        try:
+            body = self.read_request_body(max_bytes=64 * 1024)
+            payload = json.loads(body.decode("utf-8"))
+            raw_path = payload["path"]
+            if str(raw_path).strip() == "":
+                raise ValueError("不允许删除共享根目录")
+            relative_path = normalize_relative_path(str(raw_path))
+        except (TypeError, KeyError, json.JSONDecodeError):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"message": "删除请求体格式不正确"})
+            return
+        except ValueError as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+            return
+
+        target_path = resolve_relative_path(self.state.root, relative_path)
+
+        try:
+            mode = target_path.lstat().st_mode
+        except FileNotFoundError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"message": "目标不存在"})
+            return
+        except PermissionError:
+            self.send_json(HTTPStatus.FORBIDDEN, {"message": "目标无法访问"})
+            return
+        except OSError as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": f"无法读取目标状态：{exc}"})
+            return
+
+        try:
+            if stat.S_ISDIR(mode):
+                delete_directory_tree(target_path)
+                deleted_type = "目录"
+            else:
+                file_lock = self.state.get_file_lock(relative_path)
+                with file_lock:
+                    delete_file_path(target_path)
+                deleted_type = "文件"
+        except FileNotFoundError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"message": "目标不存在"})
+            return
+        except PermissionError:
+            self.send_json(HTTPStatus.FORBIDDEN, {"message": "目标无法删除"})
+            return
+        except OSError as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": f"删除失败：{exc}"})
+            return
+
+        self.send_json(
+            HTTPStatus.OK,
+            {
+                "status": "成功",
+                "path": relative_path,
+                "type": deleted_type,
+                "message": "删除完成",
+            },
+        )
+
     def handle_list(self, query: str) -> None:
         params = parse_qs(query, keep_blank_values=True)
         recursive_value = params.get("recursive", [""])[0].strip().lower()
@@ -2316,6 +2511,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_error_text(HTTPStatus.BAD_REQUEST, "下载路径不合法")
             return
 
+        params = parse_qs(query, keep_blank_values=True)
+        inline_value = params.get("inline", [""])[0].strip().lower()
+        allow_inline = inline_value in {"1", "true", "yes", "on"}
+
         file_path = resolve_relative_path(self.state.root, relative_path)
         if not file_path.is_file():
             self.send_error_text(HTTPStatus.NOT_FOUND, "未找到要下载的文件")
@@ -2340,7 +2539,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         content_length = max(0, end - start + 1)
         mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-        content_disposition = f"attachment; filename*=UTF-8''{quote(file_path.name, safe='')}"
+        disposition_type = "inline" if allow_inline else "attachment"
+        content_disposition = f"{disposition_type}; filename*=UTF-8''{quote(file_path.name, safe='')}"
 
         self.send_response(status)
         self.send_header("Content-Type", mime_type)
@@ -2485,6 +2685,11 @@ def create_servers(host: str, port: int, state: AppState) -> tuple[list[MeFileHT
     return servers, ipv6_notice
 
 
+def is_address_in_use_error(exc: OSError) -> bool:
+    error_codes = {errno.EADDRINUSE, 10048}
+    return exc.errno in error_codes or getattr(exc, "winerror", None) in error_codes
+
+
 def serve_servers(servers: list[MeFileHTTPServer]) -> None:
     threads: list[threading.Thread] = []
     try:
@@ -2526,13 +2731,20 @@ def main() -> int:
 
     password = resolve_password(args)
     state = AppState(root=root, password=password)
-    servers, ipv6_notice = create_servers(args.host, args.port, state)
+    try:
+        servers, ipv6_notice = create_servers(args.host, args.port, state)
+    except OSError as exc:
+        if is_address_in_use_error(exc):
+            print(f"端口 {args.port} 已被占用，请更换端口后重试", file=sys.stderr)
+        else:
+            print(f"启动 meFileServer 失败：{exc}", file=sys.stderr)
+        return 1
     ipv6_enabled = any(getattr(server, "address_family", None) == getattr(socket, "AF_INET6", object()) for server in servers)
     access_urls = build_access_urls(args.host, args.port, ipv6_enabled=ipv6_enabled)
 
-    auth_note = "已启用密码" if password else "未启用密码"
-    print(f"咩FileServer 已启动：{root}")
-    print(f"密码状态：{auth_note}")
+    auth_note = "已启用" if password else "无需密码"
+    print(f"咩FileServer 已启动：\n{root}")
+    print(f"访问密码：{auth_note}")
     if ipv6_notice:
         print(ipv6_notice)
     print("可访问地址：")
