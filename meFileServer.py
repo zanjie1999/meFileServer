@@ -380,6 +380,7 @@ HOME_PAGE = """<!doctype html>
       <p>已存在目录会自动合并，已存在文件会跳过</p>
       <div class="row">
         <input id="single-file-input" type="file" multiple hidden>
+        <input id="folder-file-input" type="file" multiple webkitdirectory hidden>
         <button id="upload-file-btn" type="button">上传文件</button>
         <button id="upload-folder-btn" type="button" class="secondary">上传文件夹</button>
       </div>
@@ -388,7 +389,7 @@ HOME_PAGE = """<!doctype html>
         <code id="upload-target-path">/</code>
         <button id="reset-upload-target-btn" type="button" class="light">切回根目录</button>
       </div>
-      <div class="hint">文件夹上传和下载依赖Chromium的目录访问API，建议使用Google Chrome浏览器或者Microsoft Edge浏览器</div>
+      <div class="hint">文件夹上传和下载依赖Chromium的目录访问API和HTTPS，建议使用Google Chrome浏览器或者Microsoft Edge浏览器</div>
       <div id="status" class="status">等待上传</div>
       <div class="progress-group">
         <div class="progress-block">
@@ -414,6 +415,7 @@ HOME_PAGE = """<!doctype html>
         <button id="browse-up-btn" type="button" class="light">返回上级</button>
         <button id="browse-root-btn" type="button" class="light">回到根目录</button>
         <button id="refresh-browse-btn" type="button" class="light">刷新</button>
+        <button id="create-folder-btn" type="button" class="light">新建文件夹</button>
         <button id="upload-to-current-btn" type="button">上传到当前目录</button>
         <button id="download-current-btn" type="button" class="secondary">下载当前目录</button>
       </div>
@@ -431,6 +433,7 @@ HOME_PAGE = """<!doctype html>
     const retryableUploadStatusCodes = new Set([408, 429, 500, 502, 503, 504]);
 
     const singleFileInput = document.getElementById("single-file-input");
+    const folderFileInput = document.getElementById("folder-file-input");
     const uploadFileButton = document.getElementById("upload-file-btn");
     const uploadFolderButton = document.getElementById("upload-folder-btn");
     const resetUploadTargetButton = document.getElementById("reset-upload-target-btn");
@@ -443,6 +446,7 @@ HOME_PAGE = """<!doctype html>
     const browseUpButton = document.getElementById("browse-up-btn");
     const browseRootButton = document.getElementById("browse-root-btn");
     const refreshBrowseButton = document.getElementById("refresh-browse-btn");
+    const createFolderButton = document.getElementById("create-folder-btn");
     const uploadToCurrentButton = document.getElementById("upload-to-current-btn");
     const downloadCurrentButton = document.getElementById("download-current-btn");
     const breadcrumbBarNode = document.getElementById("breadcrumb-bar");
@@ -532,6 +536,14 @@ HOME_PAGE = """<!doctype html>
       return basePath ? `${basePath}/${relativePath}` : relativePath;
     }
 
+    function canUseDirectoryPicker() {
+      return window.isSecureContext && typeof window.showDirectoryPicker === "function";
+    }
+
+    function supportsDirectoryUploadFallback() {
+      return !!folderFileInput && "webkitdirectory" in folderFileInput;
+    }
+
     function createEmptyUploadMetrics() {
       return {
         taskStartedAt: 0,
@@ -613,6 +625,7 @@ HOME_PAGE = """<!doctype html>
       browseUpButton.disabled = busy || !currentBrowsePath;
       browseRootButton.disabled = busy || !currentBrowsePath;
       refreshBrowseButton.disabled = busy || !hasCurrentDirectory;
+      createFolderButton.disabled = busy || !hasCurrentDirectory;
       uploadToCurrentButton.disabled = busy || !hasCurrentDirectory;
       downloadCurrentButton.disabled = busy || !hasCurrentDirectory;
       uploadToCurrentButton.classList.toggle("secondary", currentBrowsePath === currentUploadPath);
@@ -676,6 +689,30 @@ HOME_PAGE = """<!doctype html>
       taskProgressTextNode.textContent = parts.join(" | ");
     }
 
+    function setCurrentCountProgress(doneCount, totalCount, label = "尚未开始") {
+      const safeTotal = totalCount > 0 ? totalCount : 1;
+      const safeDone = totalCount > 0 ? Math.min(doneCount, totalCount) : (doneCount > 0 ? 1 : 0);
+      updateProgressBar(currentProgressNode, safeDone, safeTotal);
+      const percent = totalCount > 0 ? ((safeDone / totalCount) * 100).toFixed(1) : (doneCount > 0 ? "100.0" : "0.0");
+      currentProgressTextNode.textContent = [
+        label,
+        `${doneCount} / ${totalCount} 个文件`,
+        `${percent}%`,
+      ].join(" | ");
+    }
+
+    function setTaskFileCountProgress(completedFiles, skippedFiles, totalFiles, labelPrefix = "已完成") {
+      const safeTotal = totalFiles > 0 ? totalFiles : 1;
+      const safeDone = totalFiles > 0 ? Math.min(completedFiles, totalFiles) : (completedFiles > 0 ? 1 : 0);
+      updateProgressBar(taskProgressNode, safeDone, safeTotal);
+      const percent = totalFiles > 0 ? ((safeDone / totalFiles) * 100).toFixed(1) : (completedFiles > 0 ? "100.0" : "0.0");
+      taskProgressTextNode.textContent = [
+        `${labelPrefix} ${completedFiles} / ${totalFiles} 个文件`,
+        `已跳过 ${skippedFiles} 个`,
+        `${percent}%`,
+      ].join(" | ");
+    }
+
     function resetProgress() {
       resetUploadMetrics();
       setCurrentProgress(0, 0, "尚未开始");
@@ -685,6 +722,7 @@ HOME_PAGE = """<!doctype html>
     function setBusyState(nextBusy) {
       busy = nextBusy;
       singleFileInput.disabled = nextBusy;
+      folderFileInput.disabled = nextBusy;
       uploadFileButton.disabled = nextBusy;
       uploadFolderButton.disabled = nextBusy;
       updateUploadTargetView();
@@ -1080,7 +1118,7 @@ HOME_PAGE = """<!doctype html>
     async function ensureRemoteDirectories(paths) {
       const unique = Array.from(new Set(paths.filter(Boolean)));
       if (!unique.length) {
-        return;
+        return { status: "成功", created: [], skipped: [], conflicts: [] };
       }
       unique.sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b, "zh-CN"));
       const { response, payload } = await fetchJson("/api/directories", {
@@ -1094,6 +1132,7 @@ HOME_PAGE = """<!doctype html>
           : "";
         throw new Error(details || payload.message || `创建目录失败（${response.status}）`);
       }
+      return payload;
     }
 
     async function runUploadTasks(tasks, taskLabel) {
@@ -1271,6 +1310,131 @@ HOME_PAGE = """<!doctype html>
       }
     }
 
+    function collectDirectoryTasksFromInputFiles(files) {
+      const directories = new Set();
+      const tasks = [];
+      let rootPath = "";
+
+      for (const file of files) {
+        const rawRelativePath = typeof file.webkitRelativePath === "string" && file.webkitRelativePath
+          ? file.webkitRelativePath
+          : file.name;
+        const relativePath = rawRelativePath.replace(/\\\\/g, "/").split("/").filter(Boolean).join("/");
+        if (!relativePath) {
+          continue;
+        }
+
+        const pathParts = relativePath.split("/");
+        const fileName = pathParts.pop();
+        if (!fileName) {
+          continue;
+        }
+        if (!rootPath && pathParts.length) {
+          rootPath = pathParts[0];
+        }
+
+        let directoryPath = "";
+        for (const part of pathParts) {
+          directoryPath = directoryPath ? `${directoryPath}/${part}` : part;
+          directories.add(directoryPath);
+        }
+
+        tasks.push({
+          path: joinUploadPath(currentUploadPath, [...pathParts, fileName].join("/")),
+          file,
+        });
+      }
+
+      tasks.sort((left, right) => left.path.localeCompare(right.path, "zh-CN"));
+      return {
+        rootPath: rootPath || "所选文件夹",
+        directories: Array.from(directories),
+        files: tasks,
+      };
+    }
+
+    async function handleFolderFileSelection() {
+      if (busy) {
+        return;
+      }
+      const files = Array.from(folderFileInput.files || []);
+      folderFileInput.value = "";
+      if (!files.length) {
+        setStatus("未选择可上传的文件。兼容模式下不会保留纯空文件夹。");
+        return;
+      }
+
+      const collected = collectDirectoryTasksFromInputFiles(files);
+      if (!collected.files.length) {
+        setStatus("未选择可上传的文件。兼容模式下不会保留纯空文件夹。");
+        return;
+      }
+
+      try {
+        const directories = collected.directories.map((path) => joinUploadPath(currentUploadPath, path));
+        await ensureRemoteDirectories(directories);
+        await runUploadTasks(collected.files, `文件夹 ${collected.rootPath} 上传`);
+      } catch (_) {
+        return;
+      }
+    }
+
+    function validateNewFolderName(rawValue) {
+      const name = String(rawValue || "").trim();
+      if (!name) {
+        return { ok: false, message: "文件夹名称不能为空" };
+      }
+      if (name === "." || name === "..") {
+        return { ok: false, message: "文件夹名称不能是 . 或 .." };
+      }
+      if (/[\\/]/.test(name)) {
+        return { ok: false, message: "文件夹名称不能包含 / 或 \\\\" };
+      }
+      if (name.includes("\x00")) {
+        return { ok: false, message: "文件夹名称包含非法字符" };
+      }
+      if (name.endsWith(".mefs") || name.endsWith(".mefs.tmp")) {
+        return { ok: false, message: "文件夹名称不能使用系统保留后缀" };
+      }
+      return { ok: true, name };
+    }
+
+    async function createFolderInCurrentDirectory() {
+      if (busy || !currentBrowseDirectory) {
+        return;
+      }
+
+      const rawName = window.prompt("请输入新文件夹名称", "新建文件夹");
+      if (rawName === null) {
+        setStatus("已取消新建文件夹");
+        return;
+      }
+
+      const validation = validateNewFolderName(rawName);
+      if (!validation.ok) {
+        window.alert(validation.message);
+        setStatus(validation.message, true);
+        return;
+      }
+
+      const folderPath = joinUploadPath(currentBrowsePath, validation.name);
+      setBusyState(true);
+      try {
+        const payload = await ensureRemoteDirectories([folderPath]);
+        clearDirectoryCache();
+        await refreshCurrentDirectory({ force: true, silent: true });
+        if (Array.isArray(payload.skipped) && payload.skipped.includes(folderPath)) {
+          setStatus(`文件夹已存在：${getDisplayPath(folderPath)}`);
+          return;
+        }
+        setStatus(`已新建文件夹：${getDisplayPath(folderPath)}`);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusyState(false);
+      }
+    }
+
     async function collectDirectoryTasks(directoryHandle, parentPath = "") {
       const currentPath = parentPath ? `${parentPath}/${directoryHandle.name}` : directoryHandle.name;
       const directories = [currentPath];
@@ -1308,8 +1472,23 @@ HOME_PAGE = """<!doctype html>
       if (busy) {
         return;
       }
-      if (typeof window.showDirectoryPicker !== "function") {
-        setStatus("当前浏览器不支持选择文件夹上传。请使用 Chromium 内核浏览器", true);
+      if (!canUseDirectoryPicker()) {
+        if (supportsDirectoryUploadFallback()) {
+          folderFileInput.value = "";
+          if (window.isSecureContext) {
+            setStatus("当前浏览器不支持原生目录访问 API，已切换到兼容模式上传。兼容模式不会保留纯空文件夹。");
+          } else {
+            setStatus("当前访问地址不是安全上下文，已切换到兼容模式上传。兼容模式不会保留纯空文件夹。");
+          }
+          folderFileInput.click();
+          return;
+        }
+
+        if (window.isSecureContext) {
+          setStatus("当前浏览器不支持文件夹上传，请改用 Chromium 内核浏览器。", true);
+        } else {
+          setStatus("当前访问地址不是安全上下文，且浏览器不支持兼容模式文件夹上传。请改用 Chromium 浏览器并通过 localhost、127.0.0.1 或 HTTPS 访问。", true);
+        }
         return;
       }
 
@@ -1387,6 +1566,101 @@ HOME_PAGE = """<!doctype html>
       }
     }
 
+    function triggerBrowserDownload(url, fileName) {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName || "";
+      link.rel = "noopener";
+      link.style.display = "none";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    }
+
+    async function downloadCurrentDirectoryWithPicker(listing) {
+      const targetRootHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      const topDirectoryName = currentBrowseDirectory.name || "下载目录";
+      const topDirectoryHandle = await targetRootHandle.getDirectoryHandle(topDirectoryName, { create: true });
+
+      for (const directoryPath of listing.directories || []) {
+        await ensureDirectoryHandle(topDirectoryHandle, directoryPath);
+      }
+
+      const files = Array.isArray(listing.files) ? listing.files : [];
+      const totalFiles = files.length;
+      const totalBytes = files.reduce((sum, item) => sum + (item.size || 0), 0);
+      let completedFiles = 0;
+      let completedBytes = 0;
+
+      setTaskProgress(0, totalBytes, 0, 0, totalFiles);
+
+      if (!files.length) {
+        setCurrentProgress(0, 0, `${getDisplayPath(currentBrowsePath)} 是空目录`);
+        setTaskProgress(0, 0, 0, 0, 0);
+        setStatus(`目录 ${getDisplayPath(currentBrowsePath)} 已写入你选择的本地路径。`);
+        return;
+      }
+
+      for (const file of files) {
+        const relativePath = file.relative_path || file.name || "";
+        const pathParts = relativePath ? relativePath.split("/") : [];
+        const fileName = pathParts.pop() || file.name;
+        const parentRelative = pathParts.join("/");
+        const parentHandle = await ensureDirectoryHandle(topDirectoryHandle, parentRelative);
+        const fileHandle = await parentHandle.getFileHandle(fileName, { create: true });
+
+        setStatus(`正在下载：${file.path}`);
+        let currentDone = 0;
+        setCurrentProgress(0, file.size, `下载：${file.path}`);
+
+        const response = await fetch(file.download_url);
+        if (!response.ok) {
+          throw new Error(`${file.path} 下载失败（${response.status}）`);
+        }
+
+        await writeResponseToFile(fileHandle, response, (delta, written) => {
+          currentDone = written;
+          completedBytes += delta;
+          setCurrentProgress(currentDone, file.size, `下载：${file.path}`);
+          setTaskProgress(completedBytes, totalBytes, completedFiles, 0, totalFiles);
+        });
+
+        completedFiles += 1;
+        setCurrentProgress(file.size, file.size, `${file.path} 下载完成`);
+        setTaskProgress(completedBytes, totalBytes, completedFiles, 0, totalFiles);
+      }
+
+      setStatus(`目录 ${getDisplayPath(currentBrowsePath)} 已写入你选择的本地路径。`);
+    }
+
+    async function downloadCurrentDirectoryWithBrowser(listing) {
+      const files = Array.isArray(listing.files) ? listing.files : [];
+      const totalFiles = files.length;
+
+      if (!files.length) {
+        setCurrentCountProgress(0, 0, `${getDisplayPath(currentBrowsePath)} 是空目录`);
+        setTaskFileCountProgress(0, 0, 0, "已提交下载");
+        setStatus(`目录 ${getDisplayPath(currentBrowsePath)} 为空。兼容模式不会创建空目录。`);
+        return;
+      }
+
+      setTaskFileCountProgress(0, 0, totalFiles, "已提交下载");
+
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        setStatus(`正在请求浏览器下载（${index + 1}/${totalFiles}）：${file.path}`);
+        setCurrentCountProgress(0, 1, `等待浏览器接管：${file.path}`);
+        triggerBrowserDownload(file.download_url, file.name || "");
+        setCurrentCountProgress(1, 1, `已交给浏览器：${file.path}`);
+        setTaskFileCountProgress(index + 1, 0, totalFiles, "已提交下载");
+        if (index < files.length - 1) {
+          await sleep(150);
+        }
+      }
+
+      setStatus(`已向浏览器提交目录 ${getDisplayPath(currentBrowsePath)} 的 ${totalFiles} 个文件下载请求。如果浏览器提示，请允许此站点连续下载多个文件。`);
+    }
+
     async function downloadCurrentDirectory() {
       if (busy) {
         return;
@@ -1395,68 +1669,16 @@ HOME_PAGE = """<!doctype html>
         setStatus("当前没有可下载的目录", true);
         return;
       }
-      if (typeof window.showDirectoryPicker !== "function") {
-        setStatus("当前浏览器不支持选择目录下载。请使用 Chromium 内核浏览器", true);
-        return;
-      }
 
       setBusyState(true);
       try {
         setStatus(`正在读取目录清单：${getDisplayPath(currentBrowsePath)}`);
         const listing = await fetchRecursiveDirectoryListing(currentBrowsePath);
-        const targetRootHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-        const topDirectoryName = currentBrowseDirectory.name || "下载目录";
-        const topDirectoryHandle = await targetRootHandle.getDirectoryHandle(topDirectoryName, { create: true });
-
-        for (const directoryPath of listing.directories || []) {
-          await ensureDirectoryHandle(topDirectoryHandle, directoryPath);
+        if (canUseDirectoryPicker()) {
+          await downloadCurrentDirectoryWithPicker(listing);
+        } else {
+          await downloadCurrentDirectoryWithBrowser(listing);
         }
-
-        const files = Array.isArray(listing.files) ? listing.files : [];
-        const totalFiles = files.length;
-        const totalBytes = files.reduce((sum, item) => sum + (item.size || 0), 0);
-        let completedFiles = 0;
-        let completedBytes = 0;
-
-        setTaskProgress(0, totalBytes, 0, 0, totalFiles);
-
-        if (!files.length) {
-          setCurrentProgress(0, 0, `${getDisplayPath(currentBrowsePath)} 是空目录`);
-          setTaskProgress(0, 0, 0, 0, 0);
-          setStatus(`目录 ${getDisplayPath(currentBrowsePath)} 已写入你选择的本地路径。`);
-          return;
-        }
-
-        for (const file of files) {
-          const relativePath = file.relative_path || file.name || "";
-          const pathParts = relativePath ? relativePath.split("/") : [];
-          const fileName = pathParts.pop() || file.name;
-          const parentRelative = pathParts.join("/");
-          const parentHandle = await ensureDirectoryHandle(topDirectoryHandle, parentRelative);
-          const fileHandle = await parentHandle.getFileHandle(fileName, { create: true });
-
-          setStatus(`正在下载：${file.path}`);
-          let currentDone = 0;
-          setCurrentProgress(0, file.size, `下载：${file.path}`);
-
-          const response = await fetch(file.download_url);
-          if (!response.ok) {
-            throw new Error(`${file.path} 下载失败（${response.status}）`);
-          }
-
-          await writeResponseToFile(fileHandle, response, (delta, written) => {
-            currentDone = written;
-            completedBytes += delta;
-            setCurrentProgress(currentDone, file.size, `下载：${file.path}`);
-            setTaskProgress(completedBytes, totalBytes, completedFiles, 0, totalFiles);
-          });
-
-          completedFiles += 1;
-          setCurrentProgress(file.size, file.size, `${file.path} 下载完成`);
-          setTaskProgress(completedBytes, totalBytes, completedFiles, 0, totalFiles);
-        }
-
-        setStatus(`目录 ${getDisplayPath(currentBrowsePath)} 已写入你选择的本地路径。`);
       } catch (error) {
         if (error && error.name === "AbortError") {
           setStatus("已取消目录下载");
@@ -1470,6 +1692,7 @@ HOME_PAGE = """<!doctype html>
 
     uploadFileButton.addEventListener("click", uploadSingleFile);
     singleFileInput.addEventListener("change", handleSingleFileSelection);
+    folderFileInput.addEventListener("change", handleFolderFileSelection);
     uploadFolderButton.addEventListener("click", uploadFolder);
     resetUploadTargetButton.addEventListener("click", () => {
       if (busy || !currentUploadPath) {
@@ -1498,6 +1721,11 @@ HOME_PAGE = """<!doctype html>
         return;
       }
       refreshCurrentDirectory({ force: true }).catch((error) => {
+        setStatus(error.message || String(error), true);
+      });
+    });
+    createFolderButton.addEventListener("click", () => {
+      createFolderInCurrentDirectory().catch((error) => {
         setStatus(error.message || String(error), true);
       });
     });
@@ -1686,7 +1914,7 @@ def display_root_name(root: Path) -> str:
 def normalize_relative_path(raw_path: str, *, allow_empty: bool = False) -> str:
     if raw_path is None:
         raise ValueError("路径不能为空")
-    value = str(raw_path).strip().replace("\\", "/")
+    value = str(raw_path).strip().replace("\\\\", "/")
     drive, _ = os.path.splitdrive(value)
     if drive:
         raise ValueError("不允许使用绝对路径")
