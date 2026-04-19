@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # 咩FileServer
-# zyyme 20260419 v2.1
+# zyyme 20260419 v2.2
 
 import argparse
 import datetime as dt
