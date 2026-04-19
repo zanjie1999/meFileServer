@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 
-SIDECAR_SUFFIX = ".meFileServer.json"
+SIDECAR_SUFFIX = ".mefs"
 UPLOAD_READ_CHUNK = 64 * 1024
 PROGRESS_FLUSH_BYTES = 1024 * 1024
 DOWNLOAD_CHUNK = 1024 * 1024
