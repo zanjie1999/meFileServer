@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # 咩FileServer
-# zyyme 20260419
+# zyyme 20260419 v2.0
 
 import argparse
 import datetime as dt
@@ -36,7 +36,7 @@ HOME_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>咩FileServer</title>
+  <title>meFileServer</title>
   <style>
     :root {
       color-scheme: light;
@@ -106,22 +106,15 @@ HOME_PAGE = """<!doctype html>
       color: var(--muted);
       line-height: 1.6;
     }
-    .toolbar, .row {
+    .row,
+    .browser-toolbar {
       display: flex;
       gap: 12px;
       flex-wrap: wrap;
       align-items: center;
       margin-top: 14px;
     }
-    input[type="file"] {
-      max-width: 100%;
-      min-width: min(100%, 260px);
-      padding: 10px;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      background: white;
-    }
-    button, .link-button {
+    button {
       border: 0;
       border-radius: 999px;
       padding: 10px 16px;
@@ -130,13 +123,12 @@ HOME_PAGE = """<!doctype html>
       font-weight: 700;
       cursor: pointer;
       transition: transform 120ms ease, filter 120ms ease, opacity 120ms ease;
-      text-decoration: none;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 6px;
     }
-    button:hover, .link-button:hover {
+    button:hover {
       filter: brightness(1.04);
       transform: translateY(-1px);
     }
@@ -207,46 +199,116 @@ HOME_PAGE = """<!doctype html>
       border-radius: 999px;
       overflow: hidden;
     }
-    .tree-browser {
+    .breadcrumb-bar {
+      margin-top: 14px;
+      padding-bottom: 4px;
+      display: flex;
+      gap: 6px;
+      flex-wrap: nowrap;
+      align-items: center;
+      overflow-x: auto;
+      color: var(--muted);
+    }
+    .crumb-label {
+      font-size: 0.94rem;
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    .crumb-button {
+      border: 0;
+      background: transparent;
+      color: var(--accent);
+      font: inherit;
+      font-weight: 700;
+      padding: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .crumb-button.current {
+      color: var(--ink);
+      cursor: default;
+    }
+    .crumb-sep {
+      white-space: nowrap;
+      color: #7b95aa;
+    }
+    .list-browser {
       margin-top: 14px;
       overflow-x: auto;
       padding-bottom: 6px;
     }
-    .tree-root {
+    .list-wrap {
       display: grid;
       gap: 10px;
-      min-width: 100%;
-      width: max-content;
+      width: 100%;
+      min-width: max-content;
     }
-    details.tree-dir {
+    .entry-row {
       border: 1px solid var(--line);
       border-radius: 16px;
-      background: rgba(255, 255, 255, 0.75);
-      overflow: hidden;
+      padding: 12px 14px;
+      display: flex;
+      justify-content: flex-start;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: nowrap;
+      background: rgba(255, 255, 255, 0.82);
+      width: 100%;
       min-width: max-content;
     }
-    details.tree-dir > summary {
-      list-style: none;
+    .entry-row-interactive {
       cursor: pointer;
-      padding: 12px 14px;
     }
-    details.tree-dir > summary::-webkit-details-marker {
-      display: none;
+    .entry-row-interactive:hover {
+      background: rgba(231, 242, 255, 0.9);
     }
-    .tree-summary {
+    .entry-row-interactive:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .entry-main {
       display: flex;
-      justify-content: space-between;
-      gap: 12px;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    .entry-text {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      flex: 1 1 auto;
+      justify-items: start;
+      text-align: left;
+    }
+    .entry-title,
+    .entry-name,
+    .entry-link {
+      color: var(--accent);
+      font-weight: 700;
+      display: block;
+      width: 100%;
+      text-align: left;
+      white-space: nowrap;
+      text-decoration: none;
+    }
+    .entry-name {
+      border: 0;
+      background: transparent;
+      font: inherit;
+      padding: 0;
+      cursor: pointer;
+    }
+    .entry-row-interactive:hover .entry-title,
+    .entry-link:hover,
+    .entry-name:hover {
+      text-decoration: underline;
+    }
+    .entry-actions {
+      display: flex;
+      gap: 8px;
       align-items: center;
       flex-wrap: nowrap;
-      min-width: max-content;
-    }
-    .tree-title {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-      font-weight: 700;
     }
     .badge {
       padding: 3px 8px;
@@ -255,53 +317,20 @@ HOME_PAGE = """<!doctype html>
       color: #4f7194;
       font-size: 0.85rem;
       font-weight: 600;
-    }
-    .tree-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: nowrap;
-      align-items: center;
-    }
-    .tree-actions button {
       white-space: nowrap;
     }
-    .tree-children {
-      padding: 0 12px 12px 12px;
-      display: grid;
-      gap: 10px;
-    }
-    .tree-file {
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px 14px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: nowrap;
-      background: rgba(255, 255, 255, 0.82);
-      min-width: max-content;
-    }
-    .tree-file a {
-      color: var(--accent);
-      text-decoration: none;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-    .tree-file a:hover {
-      text-decoration: underline;
+    .dir-badge {
+      background: #fffbaa;
+      color: #766f1f;
     }
     .meta {
       color: var(--muted);
       font-size: 0.9rem;
+      white-space: nowrap;
     }
     .empty {
       margin-top: 12px;
       color: var(--muted);
-    }
-    .mono {
-      font-family: Consolas, "Courier New", monospace;
-      white-space: nowrap;
     }
     @media (max-width: 640px) {
       main {
@@ -310,10 +339,9 @@ HOME_PAGE = """<!doctype html>
       .panel {
         border-radius: 18px;
         padding: 16px;
-        overflow-x: auto;
       }
-      .tree-children {
-        padding-left: 16px;
+      .entry-row {
+        gap: 12px;
       }
     }
   </style>
@@ -321,7 +349,7 @@ HOME_PAGE = """<!doctype html>
 <body>
   <main>
     <section class="panel hero">
-      <h1>咩FileServer</h1>
+      <h1>meFileServer</h1>
       <p>当前共享根目录：<code>__ROOT__</code></p>
       <p>单文件简易文件服务器 支持文件目录断点续传上传下载</p>
       <p>哔哩哔哩：<a href="https://space.bilibili.com/9992930" target="_blank">郑羊羊</a> | 项目开源：<a href="https://github.com/zanjie1999/meFileServer" target="_blank">GitHub</a></p>
@@ -362,16 +390,25 @@ HOME_PAGE = """<!doctype html>
 
     <section class="panel">
       <h2>下载</h2>
-      <p>点击文件名可以直接下载，点击目录上的“上传到这”可以切换上传目录</p>
-      <div id="tree-empty" class="empty" hidden>目录为空</div>
-      <div class="tree-browser">
-        <div id="tree-root" class="tree-root"></div>
+      <div class="browser-toolbar">
+        <button id="browse-up-btn" type="button" class="light">返回上级</button>
+        <button id="browse-root-btn" type="button" class="light">回到根目录</button>
+        <button id="refresh-browse-btn" type="button" class="light">刷新</button>
+        <button id="upload-to-current-btn" type="button">上传到当前目录</button>
+        <button id="download-current-btn" type="button" class="secondary">下载当前目录</button>
+      </div>
+      <div id="breadcrumb-bar" class="breadcrumb-bar"></div>
+      <div id="browser-empty" class="empty" hidden>当前目录为空</div>
+      <div class="list-browser">
+        <div id="browser-list" class="list-wrap"></div>
       </div>
     </section>
   </main>
 
   <script>
     const chunkSize = 8 * 1024 * 1024;
+    const retryDelaySeconds = 10;
+    const retryableUploadStatusCodes = new Set([408, 429, 500, 502, 503, 504]);
 
     const singleFileInput = document.getElementById("single-file-input");
     const uploadFileButton = document.getElementById("upload-file-btn");
@@ -383,13 +420,22 @@ HOME_PAGE = """<!doctype html>
     const currentProgressTextNode = document.getElementById("current-progress-text");
     const taskProgressNode = document.getElementById("task-progress");
     const taskProgressTextNode = document.getElementById("task-progress-text");
-    const treeRootNode = document.getElementById("tree-root");
-    const treeEmptyNode = document.getElementById("tree-empty");
+    const browseUpButton = document.getElementById("browse-up-btn");
+    const browseRootButton = document.getElementById("browse-root-btn");
+    const refreshBrowseButton = document.getElementById("refresh-browse-btn");
+    const uploadToCurrentButton = document.getElementById("upload-to-current-btn");
+    const downloadCurrentButton = document.getElementById("download-current-btn");
+    const breadcrumbBarNode = document.getElementById("breadcrumb-bar");
+    const browserListNode = document.getElementById("browser-list");
+    const browserEmptyNode = document.getElementById("browser-empty");
 
-    let latestTree = null;
     let busy = false;
     let currentUploadPath = "";
-    const expandedDirectoryPaths = new Set();
+    let currentBrowsePath = "";
+    let currentBrowseDirectory = null;
+    let rootDirectoryName = "根目录";
+    const directoryCache = new Map();
+    let uploadMetrics = createEmptyUploadMetrics();
 
     function formatBytes(value) {
       if (!Number.isFinite(value) || value <= 0) {
@@ -405,11 +451,56 @@ HOME_PAGE = """<!doctype html>
       return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
     }
 
+    function formatSpeed(value) {
+      if (!Number.isFinite(value) || value <= 0) {
+        return "计算中";
+      }
+      return `${formatBytes(value)}/s`;
+    }
+
+    function formatDuration(seconds) {
+      if (!Number.isFinite(seconds) || seconds < 0) {
+        return "计算中";
+      }
+      const rounded = Math.ceil(seconds);
+      const hours = Math.floor(rounded / 3600);
+      const minutes = Math.floor((rounded % 3600) / 60);
+      const secs = rounded % 60;
+      if (hours > 0) {
+        return `${hours}小时${minutes}分钟`;
+      }
+      if (minutes > 0) {
+        return `${minutes}分${secs}秒`;
+      }
+      return `${secs}秒`;
+    }
+
     function formatDate(value) {
       if (!value) {
         return "-";
       }
       return new Date(value).toLocaleString("zh-CN");
+    }
+
+    function getDisplayPath(path) {
+      return path ? `/${path}` : "/";
+    }
+
+    function splitPath(path) {
+      return path ? path.split("/") : [];
+    }
+
+    function getParentPath(path) {
+      const parts = splitPath(path);
+      if (!parts.length) {
+        return "";
+      }
+      parts.pop();
+      return parts.join("/");
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => window.setTimeout(resolve, ms));
     }
 
     function setStatus(message, isError = false) {
@@ -421,18 +512,99 @@ HOME_PAGE = """<!doctype html>
       return basePath ? `${basePath}/${relativePath}` : relativePath;
     }
 
+    function createEmptyUploadMetrics() {
+      return {
+        taskStartedAt: 0,
+        uploadedBytes: 0,
+        currentFile: null,
+      };
+    }
+
+    function resetUploadMetrics() {
+      uploadMetrics = createEmptyUploadMetrics();
+    }
+
+    function startUploadMetrics() {
+      uploadMetrics = createEmptyUploadMetrics();
+      uploadMetrics.taskStartedAt = performance.now();
+    }
+
+    function restartCurrentUploadMetrics(path, offset) {
+      uploadMetrics.currentFile = {
+        path,
+        startOffset: offset,
+        uploadedBytes: 0,
+        startedAt: performance.now(),
+      };
+    }
+
+    function clearCurrentUploadMetrics() {
+      uploadMetrics.currentFile = null;
+    }
+
+    function recordUploadedBytes(delta) {
+      if (!Number.isFinite(delta) || delta <= 0) {
+        return;
+      }
+      uploadMetrics.uploadedBytes += delta;
+      if (uploadMetrics.currentFile) {
+        uploadMetrics.currentFile.uploadedBytes += delta;
+      }
+    }
+
+    function calculateSpeed(uploadedBytes, startedAt) {
+      if (!startedAt || !Number.isFinite(uploadedBytes) || uploadedBytes <= 0) {
+        return 0;
+      }
+      const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0);
+      if (elapsedSeconds < 0.3) {
+        return 0;
+      }
+      return uploadedBytes / elapsedSeconds;
+    }
+
+    function getCurrentUploadStats(done, total) {
+      if (!uploadMetrics.currentFile) {
+        return null;
+      }
+      return {
+        speedBytesPerSecond: calculateSpeed(uploadMetrics.currentFile.uploadedBytes, uploadMetrics.currentFile.startedAt),
+        remainingBytes: Math.max(total - done, 0),
+      };
+    }
+
+    function getTaskUploadStats(doneBytes, totalBytes) {
+      if (!uploadMetrics.taskStartedAt) {
+        return null;
+      }
+      return {
+        speedBytesPerSecond: calculateSpeed(uploadMetrics.uploadedBytes, uploadMetrics.taskStartedAt),
+        remainingBytes: Math.max(totalBytes - doneBytes, 0),
+      };
+    }
+
     function updateUploadTargetView() {
-      uploadTargetPathNode.textContent = currentUploadPath || "/";
+      uploadTargetPathNode.textContent = getDisplayPath(currentUploadPath);
       resetUploadTargetButton.disabled = busy || !currentUploadPath;
+    }
+
+    function updateBrowseControls() {
+      const hasCurrentDirectory = !!currentBrowseDirectory;
+      browseUpButton.disabled = busy || !currentBrowsePath;
+      browseRootButton.disabled = busy || !currentBrowsePath;
+      refreshBrowseButton.disabled = busy || !hasCurrentDirectory;
+      uploadToCurrentButton.disabled = busy || !hasCurrentDirectory;
+      downloadCurrentButton.disabled = busy || !hasCurrentDirectory;
+      uploadToCurrentButton.classList.toggle("secondary", currentBrowsePath === currentUploadPath);
+      uploadToCurrentButton.classList.toggle("light", currentBrowsePath !== currentUploadPath);
+      uploadToCurrentButton.textContent = currentBrowsePath === currentUploadPath ? "当前上传目录" : "切换上传目录";
     }
 
     function setUploadTarget(path) {
       currentUploadPath = path || "";
       updateUploadTargetView();
-      if (latestTree) {
-        renderTree(latestTree);
-      }
-      setStatus("上传目录切换成功");
+      updateBrowseControls();
+      setStatus(`将上传到：${getDisplayPath(currentUploadPath)}`);
     }
 
     function updateProgressBar(node, value, total) {
@@ -445,21 +617,45 @@ HOME_PAGE = """<!doctype html>
       }
     }
 
-    function setCurrentProgress(done, total, label = "尚未开始") {
-      updateProgressBar(currentProgressNode, done, total);
-      const percent = total > 0 ? ((done / total) * 100).toFixed(1) : (done > 0 ? "100.0" : "0.0");
-      currentProgressTextNode.textContent = `${label} | ${percent}% | ${formatBytes(done)} / ${formatBytes(total)}`;
+    function buildProgressSuffix(stats, speedLabel) {
+      if (!stats) {
+        return [];
+      }
+      return [
+        `${speedLabel} ${formatSpeed(stats.speedBytesPerSecond)}`,
+        `剩余 ${formatDuration(stats.speedBytesPerSecond > 0 ? stats.remainingBytes / stats.speedBytesPerSecond : Number.NaN)}`,
+      ];
     }
 
-    function setTaskProgress(doneBytes, totalBytes, completedFiles, skippedFiles, totalFiles) {
+    function setCurrentProgress(done, total, label = "尚未开始", stats = null) {
+      updateProgressBar(currentProgressNode, done, total);
+      const percent = total > 0 ? ((done / total) * 100).toFixed(1) : (done > 0 ? "100.0" : "0.0");
+      const parts = [
+        label,
+        `${formatBytes(done)} / ${formatBytes(total)}`,
+        `${percent}%`,
+        ...buildProgressSuffix(stats, "速度"),
+      ];
+      currentProgressTextNode.textContent = parts.join(" | ");
+    }
+
+    function setTaskProgress(doneBytes, totalBytes, completedFiles, skippedFiles, totalFiles, stats = null) {
       const fallbackTotal = totalBytes > 0 ? totalBytes : Math.max(totalFiles, 1);
       const fallbackDone = totalBytes > 0 ? doneBytes : completedFiles;
       updateProgressBar(taskProgressNode, fallbackDone, fallbackTotal);
       const percent = fallbackTotal > 0 ? ((fallbackDone / fallbackTotal) * 100).toFixed(1) : "0.0";
-      taskProgressTextNode.textContent = `已完成 ${completedFiles} / ${totalFiles} 个文件，已跳过 ${skippedFiles} 个，累计处理 ${formatBytes(doneBytes)} / ${formatBytes(totalBytes)}，进度 ${percent}%`;
+      const parts = [
+        `已完成 ${completedFiles} / ${totalFiles} 个文件`,
+        `已跳过 ${skippedFiles} 个`,
+        `${formatBytes(doneBytes)} / ${formatBytes(totalBytes)}`,
+        `${percent}%`,
+        ...buildProgressSuffix(stats, "平均速度"),
+      ];
+      taskProgressTextNode.textContent = parts.join(" | ");
     }
 
     function resetProgress() {
+      resetUploadMetrics();
       setCurrentProgress(0, 0, "尚未开始");
       setTaskProgress(0, 0, 0, 0, 0);
     }
@@ -470,6 +666,10 @@ HOME_PAGE = """<!doctype html>
       uploadFileButton.disabled = nextBusy;
       uploadFolderButton.disabled = nextBusy;
       updateUploadTargetView();
+      updateBrowseControls();
+      if (currentBrowseDirectory) {
+        renderDirectoryView(currentBrowseDirectory);
+      }
     }
 
     async function fetchJson(url, options = {}) {
@@ -485,174 +685,272 @@ HOME_PAGE = """<!doctype html>
       return { response, payload };
     }
 
-    function relativeFromBase(fullPath, basePath) {
-      if (!basePath) {
-        return fullPath;
-      }
-      if (fullPath === basePath) {
-        return "";
-      }
-      return fullPath.slice(basePath.length + 1);
+    function isRetryableUploadResponse(response) {
+      return retryableUploadStatusCodes.has(response.status);
     }
 
-    function collectTreeEntries(node, basePath) {
-      const directories = [];
-      const files = [];
-
-      function walk(current) {
-        if (current.type === "目录") {
-          const relativePath = relativeFromBase(current.path, basePath);
-          if (relativePath) {
-            directories.push(relativePath);
-          }
-          for (const child of current.children || []) {
-            walk(child);
-          }
-          return;
-        }
-        files.push({
-          path: current.path,
-          relativePath: relativeFromBase(current.path, basePath),
-          size: current.size,
-          download_url: current.download_url,
-        });
+    async function waitForRetryCountdown(label, retryCount) {
+      for (let remaining = retryDelaySeconds; remaining > 0; remaining -= 1) {
+        setStatus(`${label}，将在 ${remaining} 秒后自动重试，第 ${retryCount} 次重试`, true);
+        await sleep(1000);
       }
+    }
 
-      walk(node);
-      return { directories, files };
+    async function fetchUploadJsonWithRetry(url, options, label) {
+      let retryCount = 0;
+      while (true) {
+        try {
+          const result = await fetchJson(url, options);
+          if (!isRetryableUploadResponse(result.response)) {
+            return result;
+          }
+          retryCount += 1;
+          const detail = result.payload && result.payload.message ? `：${result.payload.message}` : "";
+          await waitForRetryCountdown(`${label}失败${detail}`, retryCount);
+        } catch (error) {
+          retryCount += 1;
+          const detail = error && error.message ? `：${error.message}` : "";
+          await waitForRetryCountdown(`${label}失败${detail}`, retryCount);
+        }
+      }
+    }
+
+    function buildListUrl(path = "", recursive = false) {
+      const params = new URLSearchParams();
+      if (path) {
+        params.set("path", path);
+      }
+      if (recursive) {
+        params.set("recursive", "1");
+      }
+      const query = params.toString();
+      return query ? `/api/list?${query}` : "/api/list";
+    }
+
+    function clearDirectoryCache() {
+      directoryCache.clear();
+    }
+
+    async function fetchDirectoryListing(path = "", { force = false } = {}) {
+      const cacheKey = path || "";
+      if (!force && directoryCache.has(cacheKey)) {
+        return directoryCache.get(cacheKey);
+      }
+      const { response, payload } = await fetchJson(buildListUrl(cacheKey));
+      if (!response.ok) {
+        throw new Error(payload.message || `读取目录失败（${response.status}）`);
+      }
+      const directory = payload.directory || { name: rootDirectoryName, path: cacheKey, entries: [] };
+      directoryCache.set(cacheKey, directory);
+      if (cacheKey === "") {
+        rootDirectoryName = directory.name || rootDirectoryName;
+      }
+      return directory;
+    }
+
+    async function fetchRecursiveDirectoryListing(path = "") {
+      const { response, payload } = await fetchJson(buildListUrl(path, true));
+      if (!response.ok) {
+        throw new Error(payload.message || `读取目录清单失败（${response.status}）`);
+      }
+      return payload;
     }
 
     function createMetaText(parts) {
       return parts.filter(Boolean).join(" | ");
     }
 
-    function renderFileNode(node) {
-      const wrapper = document.createElement("div");
-      wrapper.className = "tree-file";
+    function renderBreadcrumb(directory) {
+      breadcrumbBarNode.innerHTML = "";
 
-      const link = document.createElement("a");
-      link.href = node.download_url;
-      link.textContent = node.name;
+      const label = document.createElement("span");
+      label.className = "crumb-label";
+      label.textContent = "当前位置：";
+      breadcrumbBarNode.appendChild(label);
+
+      const rootButton = document.createElement("button");
+      rootButton.type = "button";
+      rootButton.className = "crumb-button";
+      rootButton.textContent = rootDirectoryName || "根目录";
+      if (!directory.path) {
+        rootButton.disabled = true;
+        rootButton.classList.add("current");
+      } else {
+        rootButton.addEventListener("click", () => {
+          if (busy) {
+            return;
+          }
+          browseTo("").catch((error) => {
+            setStatus(error.message || String(error), true);
+          });
+        });
+      }
+      breadcrumbBarNode.appendChild(rootButton);
+
+      let walked = "";
+      for (const part of splitPath(directory.path)) {
+        const separator = document.createElement("span");
+        separator.className = "crumb-sep";
+        separator.textContent = "/";
+        breadcrumbBarNode.appendChild(separator);
+
+        walked = walked ? `${walked}/${part}` : part;
+        const partButton = document.createElement("button");
+        partButton.type = "button";
+        partButton.className = "crumb-button";
+        partButton.textContent = part;
+        if (walked === directory.path) {
+          partButton.disabled = true;
+          partButton.classList.add("current");
+        } else {
+          const targetPath = walked;
+          partButton.addEventListener("click", () => {
+            if (busy) {
+              return;
+            }
+            browseTo(targetPath).catch((error) => {
+              setStatus(error.message || String(error), true);
+            });
+          });
+        }
+        breadcrumbBarNode.appendChild(partButton);
+      }
+    }
+
+    function renderFileEntry(entry) {
+      const row = createInteractiveEntryRow(() => {
+        window.location.assign(entry.download_url);
+      });
+
+      const main = document.createElement("div");
+      main.className = "entry-main";
+
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "文件";
+
+      const text = document.createElement("div");
+      text.className = "entry-text";
+
+      const title = document.createElement("span");
+      title.className = "entry-title";
+      title.textContent = entry.name;
 
       const meta = document.createElement("div");
       meta.className = "meta";
       meta.textContent = createMetaText([
-        formatBytes(node.size),
-        formatDate(node.mtime),
+        formatBytes(entry.size),
+        formatDate(entry.mtime),
       ]);
 
-      wrapper.appendChild(link);
-      wrapper.appendChild(meta);
-      return wrapper;
+      text.appendChild(title);
+      text.appendChild(meta);
+      main.appendChild(badge);
+      main.appendChild(text);
+      row.appendChild(main);
+      return row;
     }
 
-    function renderDirectoryNode(node, isRoot = false) {
-      const details = document.createElement("details");
-      details.className = "tree-dir";
-      details.open = isRoot || expandedDirectoryPaths.has(node.path);
-      details.addEventListener("toggle", () => {
-        if (isRoot) {
+    function createInteractiveEntryRow(onActivate) {
+      const row = document.createElement("div");
+      row.className = "entry-row entry-row-interactive";
+      row.tabIndex = busy ? -1 : 0;
+      row.setAttribute("role", "link");
+      row.addEventListener("click", () => {
+        if (busy) {
           return;
         }
-        if (details.open) {
-          expandedDirectoryPaths.add(node.path);
-        } else {
-          expandedDirectoryPaths.delete(node.path);
+        onActivate();
+      });
+      row.addEventListener("keydown", (event) => {
+        if (busy) {
+          return;
+        }
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onActivate();
         }
       });
+      return row;
+    }
 
-      const summary = document.createElement("summary");
-      const summaryRow = document.createElement("div");
-      summaryRow.className = "tree-summary";
+    function renderDirectoryEntry(entry) {
+      const row = createInteractiveEntryRow(() => {
+        browseTo(entry.path).catch((error) => {
+          setStatus(error.message || String(error), true);
+        });
+      });
 
-      const titleWrap = document.createElement("div");
-      titleWrap.className = "tree-title";
-
-      const title = document.createElement("span");
-      title.textContent = isRoot ? `根目录：${node.name}` : node.name;
+      const main = document.createElement("div");
+      main.className = "entry-main";
 
       const badge = document.createElement("span");
-      badge.className = "badge";
-      badge.textContent = `${node.children.length} 项`;
+      badge.className = "badge dir-badge";
+      badge.textContent = "目录";
 
-      titleWrap.appendChild(title);
-      titleWrap.appendChild(badge);
+      const text = document.createElement("div");
+      text.className = "entry-text";
 
-      const actions = document.createElement("div");
-      actions.className = "tree-actions";
+      const title = document.createElement("span");
+      title.className = "entry-title";
+      title.textContent = entry.name;
 
-      if (!isRoot) {
-        const uploadButton = document.createElement("button");
-        uploadButton.type = "button";
-        uploadButton.className = node.path === currentUploadPath ? "secondary" : "light";
-        uploadButton.textContent = node.path === currentUploadPath ? "当前选择" : "上传到这";
-        uploadButton.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          setUploadTarget(node.path);
-        });
-        actions.appendChild(uploadButton);
-      }
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = createMetaText([
+        "点击进入",
+        formatDate(entry.mtime),
+      ]);
 
-      const downloadButton = document.createElement("button");
-      downloadButton.type = "button";
-      downloadButton.className = "light";
-      downloadButton.textContent = isRoot ? "下载整个根目录" : "下载目录";
-      downloadButton.addEventListener("click", async (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        await downloadDirectoryNode(node);
-      });
-
-      actions.appendChild(downloadButton);
-
-      summaryRow.appendChild(titleWrap);
-      summaryRow.appendChild(actions);
-      summary.appendChild(summaryRow);
-      details.appendChild(summary);
-
-      const childrenWrap = document.createElement("div");
-      childrenWrap.className = "tree-children";
-      if (!node.children.length) {
-        const empty = document.createElement("div");
-        empty.className = "meta";
-        empty.textContent = "目录为空";
-        childrenWrap.appendChild(empty);
-      } else {
-        for (const child of node.children) {
-          if (child.type === "目录") {
-            childrenWrap.appendChild(renderDirectoryNode(child));
-          } else {
-            childrenWrap.appendChild(renderFileNode(child));
-          }
-        }
-      }
-      details.appendChild(childrenWrap);
-      return details;
+      text.appendChild(title);
+      text.appendChild(meta);
+      main.appendChild(badge);
+      main.appendChild(text);
+      row.appendChild(main);
+      return row;
     }
 
-    function renderTree(tree) {
-      treeRootNode.innerHTML = "";
-      latestTree = tree;
-      const hasItems = !!tree && Array.isArray(tree.children) && tree.children.length > 0;
-      treeEmptyNode.hidden = hasItems;
-      if (!tree) {
+    function renderDirectoryView(directory) {
+      currentBrowseDirectory = directory;
+      currentBrowsePath = directory.path || "";
+      renderBreadcrumb(directory);
+      updateBrowseControls();
+
+      browserListNode.innerHTML = "";
+      const entries = Array.isArray(directory.entries) ? directory.entries : [];
+      browserEmptyNode.hidden = entries.length > 0;
+      if (!entries.length) {
         return;
       }
-      treeRootNode.appendChild(renderDirectoryNode(tree, true));
+
+      for (const entry of entries) {
+        if (entry.type === "目录") {
+          browserListNode.appendChild(renderDirectoryEntry(entry));
+        } else {
+          browserListNode.appendChild(renderFileEntry(entry));
+        }
+      }
     }
 
-    async function refreshTree() {
-      const { response, payload } = await fetchJson("/api/list");
-      if (!response.ok) {
-        throw new Error(payload.message || `读取目录失败（${response.status}）`);
+    async function browseTo(path, { force = false, silent = false, message = "" } = {}) {
+      const directory = await fetchDirectoryListing(path, { force });
+      renderDirectoryView(directory);
+      if (!silent) {
+        setStatus(message || `已打开目录：${getDisplayPath(directory.path)}`);
       }
-      renderTree(payload.tree);
+    }
+
+    async function refreshCurrentDirectory({ force = true, silent = false } = {}) {
+      await browseTo(currentBrowsePath, {
+        force,
+        silent,
+        message: `已刷新：${getDisplayPath(currentBrowsePath)}`,
+      });
     }
 
     async function uploadChunk(task, start, end) {
       const body = task.file.slice(start, end);
-      return fetchJson(`/api/upload?path=${encodeURIComponent(task.path)}`, {
+      return fetchUploadJsonWithRetry(`/api/upload?path=${encodeURIComponent(task.path)}`, {
         method: "POST",
         headers: {
           "X-Start-Offset": String(start),
@@ -660,11 +958,11 @@ HOME_PAGE = """<!doctype html>
           "X-File-Mtime": String(task.file.lastModified),
         },
         body,
-      });
+      }, `上传 ${task.path}`);
     }
 
     async function probeTask(task) {
-      return fetchJson("/api/probe", {
+      return fetchUploadJsonWithRetry("/api/probe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -672,7 +970,7 @@ HOME_PAGE = """<!doctype html>
           size: task.file.size,
           mtime_ms: task.file.lastModified,
         }),
-      });
+      }, `探测 ${task.path}`);
     }
 
     async function ensureRemoteDirectories(paths) {
@@ -696,22 +994,25 @@ HOME_PAGE = """<!doctype html>
 
     async function runUploadTasks(tasks, taskLabel) {
       if (!tasks.length) {
+        clearDirectoryCache();
+        await refreshCurrentDirectory({ force: true, silent: true });
         setStatus(`${taskLabel}没有需要上传的文件。`);
-        await refreshTree();
         return;
       }
 
       setBusyState(true);
+      startUploadMetrics();
       const totalFiles = tasks.length;
       const totalBytes = tasks.reduce((sum, item) => sum + item.file.size, 0);
       let completedFiles = 0;
       let skippedFiles = 0;
       let completedBytes = 0;
 
-      setTaskProgress(0, totalBytes, 0, 0, totalFiles);
+      setTaskProgress(0, totalBytes, 0, 0, totalFiles, getTaskUploadStats(0, totalBytes));
 
       try {
         for (const task of tasks) {
+          clearCurrentUploadMetrics();
           setStatus(`正在检查：${task.path}`);
           const { response: probeResponse, payload: probePayload } = await probeTask(task);
           if (!probeResponse.ok) {
@@ -727,13 +1028,28 @@ HOME_PAGE = """<!doctype html>
             skippedFiles += 1;
             completedBytes += task.file.size;
             setCurrentProgress(task.file.size, task.file.size, `${task.path} 已存在，已跳过`);
-            setTaskProgress(completedBytes, totalBytes, completedFiles, skippedFiles, totalFiles);
+            setTaskProgress(
+              completedBytes,
+              totalBytes,
+              completedFiles,
+              skippedFiles,
+              totalFiles,
+              getTaskUploadStats(completedBytes, totalBytes),
+            );
             continue;
           }
 
           let offset = Number(probePayload.offset || 0);
-          setCurrentProgress(offset, task.file.size, `准备上传：${task.path}`);
-          setTaskProgress(completedBytes + offset, totalBytes, completedFiles, skippedFiles, totalFiles);
+          restartCurrentUploadMetrics(task.path, offset);
+          setCurrentProgress(offset, task.file.size, `准备上传：${task.path}`, getCurrentUploadStats(offset, task.file.size));
+          setTaskProgress(
+            completedBytes + offset,
+            totalBytes,
+            completedFiles,
+            skippedFiles,
+            totalFiles,
+            getTaskUploadStats(completedBytes + offset, totalBytes),
+          );
 
           if (task.file.size === 0) {
             const { response, payload } = await uploadChunk(task, 0, 0);
@@ -741,9 +1057,16 @@ HOME_PAGE = """<!doctype html>
               throw new Error(payload.message || `上传失败（${response.status}）`);
             }
             completedFiles += 1;
-            completedBytes += 0;
             setCurrentProgress(0, 0, `${task.path} 上传完成`);
-            setTaskProgress(completedBytes, totalBytes, completedFiles, skippedFiles, totalFiles);
+            setTaskProgress(
+              completedBytes,
+              totalBytes,
+              completedFiles,
+              skippedFiles,
+              totalFiles,
+              getTaskUploadStats(completedBytes, totalBytes),
+            );
+            clearCurrentUploadMetrics();
             continue;
           }
 
@@ -760,9 +1083,17 @@ HOME_PAGE = """<!doctype html>
                 throw new Error(`${task.path}：服务器返回了无效的续传位置。`);
               }
               offset = payload.offset;
-              setStatus(`已同步服务器进度，继续上传：${task.path}`);
-              setCurrentProgress(offset, task.file.size, `续传：${task.path}`);
-              setTaskProgress(completedBytes + offset, totalBytes, completedFiles, skippedFiles, totalFiles);
+              restartCurrentUploadMetrics(task.path, offset);
+              setStatus(`已同步服务端进度，继续上传：${task.path}`);
+              setCurrentProgress(offset, task.file.size, `继续上传：${task.path}`, getCurrentUploadStats(offset, task.file.size));
+              setTaskProgress(
+                completedBytes + offset,
+                totalBytes,
+                completedFiles,
+                skippedFiles,
+                totalFiles,
+                getTaskUploadStats(completedBytes + offset, totalBytes),
+              );
               continue;
             }
 
@@ -770,23 +1101,42 @@ HOME_PAGE = """<!doctype html>
               throw new Error(payload.message || `上传失败（${response.status}）`);
             }
 
-            offset = Number(payload.offset || end);
-            setCurrentProgress(offset, task.file.size, `正在上传：${task.path}`);
-            setTaskProgress(completedBytes + offset, totalBytes, completedFiles, skippedFiles, totalFiles);
+            const nextOffset = Number(payload.offset || end);
+            recordUploadedBytes(nextOffset - offset);
+            offset = nextOffset;
+            setCurrentProgress(offset, task.file.size, `正在上传：${task.path}`, getCurrentUploadStats(offset, task.file.size));
+            setTaskProgress(
+              completedBytes + offset,
+              totalBytes,
+              completedFiles,
+              skippedFiles,
+              totalFiles,
+              getTaskUploadStats(completedBytes + offset, totalBytes),
+            );
           }
 
           completedFiles += 1;
           completedBytes += task.file.size;
-          setCurrentProgress(task.file.size, task.file.size, `${task.path} 上传完成`);
-          setTaskProgress(completedBytes, totalBytes, completedFiles, skippedFiles, totalFiles);
+          setCurrentProgress(task.file.size, task.file.size, `${task.path} 上传完成`, getCurrentUploadStats(task.file.size, task.file.size));
+          setTaskProgress(
+            completedBytes,
+            totalBytes,
+            completedFiles,
+            skippedFiles,
+            totalFiles,
+            getTaskUploadStats(completedBytes, totalBytes),
+          );
+          clearCurrentUploadMetrics();
         }
 
-        await refreshTree();
+        clearDirectoryCache();
+        await refreshCurrentDirectory({ force: true, silent: true });
         setStatus(`${taskLabel}完成，共处理 ${completedFiles} 个文件，其中跳过 ${skippedFiles} 个。`);
       } catch (error) {
         setStatus(error.message || String(error), true);
         throw error;
       } finally {
+        clearCurrentUploadMetrics();
         setBusyState(false);
       }
     }
@@ -812,7 +1162,7 @@ HOME_PAGE = """<!doctype html>
       const tasks = files.map((file) => ({ path: joinUploadPath(currentUploadPath, file.name), file }));
       try {
         await runUploadTasks(tasks, "文件上传");
-      } catch (error) {
+      } catch (_) {
         return;
       }
     }
@@ -855,7 +1205,7 @@ HOME_PAGE = """<!doctype html>
         return;
       }
       if (typeof window.showDirectoryPicker !== "function") {
-        setStatus("当前浏览器不支持选择文件夹上传。请使用Chromium内核浏览器", true);
+        setStatus("当前浏览器不支持选择文件夹上传。请使用 Chromium 内核浏览器", true);
         return;
       }
 
@@ -870,7 +1220,8 @@ HOME_PAGE = """<!doctype html>
         }));
         await ensureRemoteDirectories(directories);
         if (!files.length) {
-          await refreshTree();
+          clearDirectoryCache();
+          await refreshCurrentDirectory({ force: true, silent: true });
           setStatus(`文件夹 ${collected.rootPath} 已创建完成，其中没有文件需要上传。`);
           return;
         }
@@ -932,41 +1283,50 @@ HOME_PAGE = """<!doctype html>
       }
     }
 
-    async function downloadDirectoryNode(node) {
+    async function downloadCurrentDirectory() {
       if (busy) {
         return;
       }
-      if (!node || node.type !== "目录") {
-        setStatus("当前节点不是目录，无法下载", true);
+      if (!currentBrowseDirectory) {
+        setStatus("当前没有可下载的目录", true);
         return;
       }
       if (typeof window.showDirectoryPicker !== "function") {
-        setStatus("当前浏览器不支持选择文件夹上传。请使用Chromium内核浏览器", true);
+        setStatus("当前浏览器不支持选择目录下载。请使用 Chromium 内核浏览器", true);
         return;
       }
 
-      const entries = collectTreeEntries(node, node.path);
-      const totalFiles = entries.files.length;
-      const totalBytes = entries.files.reduce((sum, item) => sum + (item.size || 0), 0);
-
       setBusyState(true);
       try {
+        setStatus(`正在读取目录清单：${getDisplayPath(currentBrowsePath)}`);
+        const listing = await fetchRecursiveDirectoryListing(currentBrowsePath);
         const targetRootHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-        const topDirectoryName = node.name || "下载目录";
+        const topDirectoryName = currentBrowseDirectory.name || "下载目录";
         const topDirectoryHandle = await targetRootHandle.getDirectoryHandle(topDirectoryName, { create: true });
 
-        for (const directoryPath of entries.directories) {
+        for (const directoryPath of listing.directories || []) {
           await ensureDirectoryHandle(topDirectoryHandle, directoryPath);
         }
 
+        const files = Array.isArray(listing.files) ? listing.files : [];
+        const totalFiles = files.length;
+        const totalBytes = files.reduce((sum, item) => sum + (item.size || 0), 0);
         let completedFiles = 0;
         let completedBytes = 0;
+
         setTaskProgress(0, totalBytes, 0, 0, totalFiles);
 
-        for (const file of entries.files) {
-          const relativePath = file.relativePath;
-          const pathParts = relativePath.split("/");
-          const fileName = pathParts.pop();
+        if (!files.length) {
+          setCurrentProgress(0, 0, `${getDisplayPath(currentBrowsePath)} 是空目录`);
+          setTaskProgress(0, 0, 0, 0, 0);
+          setStatus(`目录 ${getDisplayPath(currentBrowsePath)} 已写入你选择的本地路径。`);
+          return;
+        }
+
+        for (const file of files) {
+          const relativePath = file.relative_path || file.name || "";
+          const pathParts = relativePath ? relativePath.split("/") : [];
+          const fileName = pathParts.pop() || file.name;
           const parentRelative = pathParts.join("/");
           const parentHandle = await ensureDirectoryHandle(topDirectoryHandle, parentRelative);
           const fileHandle = await parentHandle.getFileHandle(fileName, { create: true });
@@ -992,11 +1352,7 @@ HOME_PAGE = """<!doctype html>
           setTaskProgress(completedBytes, totalBytes, completedFiles, 0, totalFiles);
         }
 
-        if (!entries.files.length) {
-          setCurrentProgress(0, 0, `${node.path || node.name} 是空目录`);
-          setTaskProgress(0, 0, 0, 0, 0);
-        }
-        setStatus(`目录 ${node.path || node.name} 已写入你选择的本地路径。`);
+        setStatus(`目录 ${getDisplayPath(currentBrowsePath)} 已写入你选择的本地路径。`);
       } catch (error) {
         if (error && error.name === "AbortError") {
           setStatus("已取消目录下载");
@@ -1017,11 +1373,42 @@ HOME_PAGE = """<!doctype html>
       }
       setUploadTarget("");
     });
+    browseUpButton.addEventListener("click", () => {
+      if (busy || !currentBrowsePath) {
+        return;
+      }
+      browseTo(getParentPath(currentBrowsePath)).catch((error) => {
+        setStatus(error.message || String(error), true);
+      });
+    });
+    browseRootButton.addEventListener("click", () => {
+      if (busy || !currentBrowsePath) {
+        return;
+      }
+      browseTo("").catch((error) => {
+        setStatus(error.message || String(error), true);
+      });
+    });
+    refreshBrowseButton.addEventListener("click", () => {
+      if (busy || !currentBrowseDirectory) {
+        return;
+      }
+      refreshCurrentDirectory({ force: true }).catch((error) => {
+        setStatus(error.message || String(error), true);
+      });
+    });
+    uploadToCurrentButton.addEventListener("click", () => {
+      if (busy || !currentBrowseDirectory) {
+        return;
+      }
+      setUploadTarget(currentBrowsePath);
+    });
+    downloadCurrentButton.addEventListener("click", downloadCurrentDirectory);
 
     resetProgress();
     setBusyState(false);
     updateUploadTargetView();
-    refreshTree().catch((error) => {
+    browseTo("", { force: true, silent: true }).catch((error) => {
       setStatus(error.message || String(error), true);
     });
   </script>
@@ -1343,73 +1730,131 @@ def inspect_upload_state(file_path: Path, incoming_size: int | None = None, inco
     return {"status": "新文件", "offset": 0, "message": "这是一个新文件，将从头开始上传"}
 
 
-def build_tree_node(root: Path, current_path: str = "") -> dict[str, Any] | None:
-    absolute_path = root if not current_path else resolve_relative_path(root, current_path)
-    name = display_root_name(root) if not current_path else absolute_path.name
+def is_sidecar_entry_name(name: str) -> bool:
+    return name.endswith(SIDECAR_SUFFIX) or name.endswith(SIDECAR_SUFFIX + ".tmp")
 
+
+def entry_sort_key(item: Path) -> tuple[int, str]:
+    try:
+        is_dir = item.is_dir()
+    except OSError:
+        is_dir = False
+    return (0 if is_dir else 1, item.name.lower())
+
+
+def list_visible_entries(directory_path: Path) -> list[Path]:
+    entries = [entry for entry in directory_path.iterdir() if not is_sidecar_entry_name(entry.name)]
+    entries.sort(key=entry_sort_key)
+    return entries
+
+
+def build_download_url(relative_path: str) -> str:
+    return "/download?path=" + quote(relative_path, safe="")
+
+
+def relative_path_from_base(full_path: str, base_path: str) -> str:
+    if not base_path:
+        return full_path
+    if full_path == base_path:
+        return ""
+    return full_path[len(base_path) + 1 :]
+
+
+def list_directory(root: Path, current_path: str = "") -> dict[str, Any]:
+    absolute_path = root if not current_path else resolve_relative_path(root, current_path)
     try:
         stat = absolute_path.stat()
-    except OSError:
-        if current_path:
-            return None
-        return {
-            "type": "目录",
-            "name": name,
-            "path": current_path,
-            "mtime": 0,
-            "children": [],
-        }
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise PermissionError(str(exc)) from exc
 
-    children: list[dict[str, Any]] = []
+    if not absolute_path.is_dir():
+        raise NotADirectoryError(str(absolute_path))
+
     try:
-        entries = [
-            entry
-            for entry in absolute_path.iterdir()
-            if not entry.name.endswith(SIDECAR_SUFFIX) and not entry.name.endswith(SIDECAR_SUFFIX + ".tmp")
-        ]
-    except OSError:
-        if current_path:
-            return None
-        entries = []
+        children = list_visible_entries(absolute_path)
+    except OSError as exc:
+        raise PermissionError(str(exc)) from exc
 
-    def entry_sort_key(item: Path) -> tuple[int, str]:
-        try:
-            is_dir = item.is_dir()
-        except OSError:
-            is_dir = False
-        return (0 if is_dir else 1, item.name.lower())
-
-    entries.sort(key=entry_sort_key)
-
-    for entry in entries:
+    entries: list[dict[str, Any]] = []
+    for entry in children:
         entry_path = f"{current_path}/{entry.name}" if current_path else entry.name
         try:
             if entry.is_dir():
-                child = build_tree_node(root, entry_path)
-                if child is not None:
-                    children.append(child)
-                continue
-            if entry.is_file():
                 entry_stat = entry.stat()
-                children.append(
+                entries.append(
+                    {
+                        "type": "目录",
+                        "name": entry.name,
+                        "path": entry_path,
+                        "mtime": int(entry_stat.st_mtime * 1000),
+                    }
+                )
+            elif entry.is_file():
+                entry_stat = entry.stat()
+                entries.append(
                     {
                         "type": "文件",
                         "name": entry.name,
                         "path": entry_path,
                         "size": entry_stat.st_size,
                         "mtime": int(entry_stat.st_mtime * 1000),
-                        "download_url": "/download?path=" + quote(entry_path, safe=""),
+                        "download_url": build_download_url(entry_path),
                     }
                 )
         except OSError:
             continue
 
     return {
-        "type": "目录",
-        "name": name,
+        "name": display_root_name(root) if not current_path else absolute_path.name,
         "path": current_path,
         "mtime": int(stat.st_mtime * 1000),
-        "children": children,
+        "entries": entries,
+    }
+
+
+def collect_recursive_directory_listing(root: Path, current_path: str = "") -> dict[str, Any]:
+    directory = list_directory(root, current_path)
+    directories: list[str] = []
+    files: list[dict[str, Any]] = []
+
+    def walk(path_value: str) -> None:
+        absolute_path = root if not path_value else resolve_relative_path(root, path_value)
+        try:
+            entries = list_visible_entries(absolute_path)
+        except OSError:
+            return
+
+        for entry in entries:
+            entry_path = f"{path_value}/{entry.name}" if path_value else entry.name
+            try:
+                if entry.is_dir():
+                    relative_dir = relative_path_from_base(entry_path, current_path)
+                    if relative_dir:
+                        directories.append(relative_dir)
+                    walk(entry_path)
+                elif entry.is_file():
+                    entry_stat = entry.stat()
+                    files.append(
+                        {
+                            "name": entry.name,
+                            "path": entry_path,
+                            "relative_path": relative_path_from_base(entry_path, current_path),
+                            "size": entry_stat.st_size,
+                            "mtime": int(entry_stat.st_mtime * 1000),
+                            "download_url": build_download_url(entry_path),
+                        }
+                    )
+            except OSError:
+                continue
+
+    walk(current_path)
+    return {
+        "name": directory["name"],
+        "path": current_path,
+        "directories": directories,
+        "files": files,
     }
 
 
@@ -1466,7 +1911,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/list":
                 if not self.ensure_authenticated(api=True):
                     return
-                self.send_json(HTTPStatus.OK, {"status": "成功", "tree": build_tree_node(self.state.root)})
+                self.handle_list(parsed.query)
                 return
 
             if parsed.path == "/download":
@@ -1694,6 +2139,41 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.CONFLICT, response)
             return
         self.send_json(HTTPStatus.OK, response)
+
+    def handle_list(self, query: str) -> None:
+        params = parse_qs(query, keep_blank_values=True)
+        recursive_value = params.get("recursive", [""])[0].strip().lower()
+        recursive = recursive_value in {"1", "true", "yes", "on"}
+
+        try:
+            relative_path = self.parse_query_path(query, allow_empty=True)
+        except ValueError as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+            return
+
+        try:
+            if recursive:
+                listing = collect_recursive_directory_listing(self.state.root, relative_path)
+                self.send_json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "成功",
+                        "name": listing["name"],
+                        "path": listing["path"],
+                        "directories": listing["directories"],
+                        "files": listing["files"],
+                    },
+                )
+                return
+
+            directory = list_directory(self.state.root, relative_path)
+            self.send_json(HTTPStatus.OK, {"status": "成功", "directory": directory})
+        except FileNotFoundError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"message": "目录不存在"})
+        except NotADirectoryError:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"message": "请求路径不是目录"})
+        except PermissionError:
+            self.send_json(HTTPStatus.FORBIDDEN, {"message": "目录无法访问"})
 
     def handle_probe(self) -> None:
         try:
