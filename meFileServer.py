@@ -806,7 +806,7 @@ HOME_PAGE = """<!doctype html>
       const files = Array.from(singleFileInput.files || []);
       singleFileInput.value = "";
       if (!files.length) {
-        setStatus("已取消选择文件。");
+        setStatus("已取消选择文件");
         return;
       }
       const tasks = files.map((file) => ({ path: joinUploadPath(currentUploadPath, file.name), file }));
@@ -877,7 +877,7 @@ HOME_PAGE = """<!doctype html>
         await runUploadTasks(files, `文件夹 ${collected.rootPath} 上传`);
       } catch (error) {
         if (error && error.name === "AbortError") {
-          setStatus("已取消选择文件夹。");
+          setStatus("已取消选择文件夹");
           return;
         }
         setStatus(error.message || String(error), true);
@@ -937,7 +937,7 @@ HOME_PAGE = """<!doctype html>
         return;
       }
       if (!node || node.type !== "目录") {
-        setStatus("当前节点不是目录，无法下载。", true);
+        setStatus("当前节点不是目录，无法下载", true);
         return;
       }
       if (typeof window.showDirectoryPicker !== "function") {
@@ -999,7 +999,7 @@ HOME_PAGE = """<!doctype html>
         setStatus(`目录 ${node.path || node.name} 已写入你选择的本地路径。`);
       } catch (error) {
         if (error && error.name === "AbortError") {
-          setStatus("已取消目录下载。");
+          setStatus("已取消目录下载");
         } else {
           setStatus(error.message || String(error), true);
         }
@@ -1481,7 +1481,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应页面。")
+            self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应页面")
         except Exception:
             self.handle_unexpected_error()
 
@@ -1510,7 +1510,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.handle_upload(parsed.query)
                 return
 
-            self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应接口。")
+            self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应接口")
         except Exception:
             self.handle_unexpected_error()
 
@@ -1549,7 +1549,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if api:
             self.send_json(HTTPStatus.UNAUTHORIZED, {"message": "需要先登录才能访问此接口"})
         else:
-            self.send_error_text(HTTPStatus.UNAUTHORIZED, "需要先登录才能访问该资源。")
+            self.send_error_text(HTTPStatus.UNAUTHORIZED, "需要先登录才能访问该资源")
         return False
 
     def read_request_body(self, max_bytes: int | None = None) -> bytes:
@@ -1631,7 +1631,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
         password = params.get("password", [""])[0]
         if not secrets.compare_digest(password, self.state.password):
-            self.send_html(HTTPStatus.UNAUTHORIZED, render_login_page("密码不正确。"))
+            self.send_html(HTTPStatus.UNAUTHORIZED, render_login_page("密码不正确"))
             return
 
         token = self.state.create_session()
@@ -1820,12 +1820,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             relative_path = self.parse_query_path(query)
         except ValueError:
-            self.send_error_text(HTTPStatus.BAD_REQUEST, "下载路径不合法。")
+            self.send_error_text(HTTPStatus.BAD_REQUEST, "下载路径不合法")
             return
 
         file_path = resolve_relative_path(self.state.root, relative_path)
         if not file_path.is_file():
-            self.send_error_text(HTTPStatus.NOT_FOUND, "未找到要下载的文件。")
+            self.send_error_text(HTTPStatus.NOT_FOUND, "未找到要下载的文件")
             return
 
         file_size = file_path.stat().st_size
@@ -1884,7 +1884,7 @@ def prompt_password() -> str:
     try:
         return getpass.getpass("共享访问密码（直接回车就不用密码，输入的密码不会显示）：")
     except EOFError:
-        print("\n当前环境无法交互输入密码，将以无鉴权模式启动。", file=sys.stderr)
+        print("\n当前环境无法交互输入密码，将以无鉴权模式启动", file=sys.stderr)
         return ""
 
 
@@ -1914,7 +1914,7 @@ def main() -> int:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n正在关闭 咩FileServer。")
+        print("\n正在关闭 咩FileServer")
     finally:
         server.server_close()
     return 0
