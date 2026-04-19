@@ -6,5 +6,7 @@
 对方无需安装任何软件！你无需进行任何配置，只要运行一下（这或许是史上最简单从iPhone导出照片的方式）  
 假如你有公网IP，那你可以直接把端口映射出去，给你的朋友传文件，或是找他要文件，对方只需要打开浏览器
 
+## 使用方法
 在右侧Releases下载exe文件，放到需要共享的目录直接运行即可  
-其他操作系统下载 `meFileServer.py` 源文件，使用终端运行 `python3 meFileServer.py` 启动
+其他操作系统下载 `meFileServer.py` 源文件，使用终端运行 `python3 meFileServer.py` 启动  
+比如先打开终端，`cd`空格把想共享的文件夹拖进来，回车后输入`python3`空格把`meFileServer.py`拖进来，回车即可启动服务器

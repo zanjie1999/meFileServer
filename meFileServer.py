@@ -97,11 +97,6 @@ HOME_PAGE = """<!doctype html>
       border-radius: 8px;
       word-break: break-all;
     }
-    .grid {
-      display: grid;
-      gap: 18px;
-      grid-template-columns: 1fr;
-    }
     h2 {
       margin: 0 0 10px;
       font-size: 1.22rem;
@@ -271,7 +266,7 @@ HOME_PAGE = """<!doctype html>
       white-space: nowrap;
     }
     .tree-children {
-      padding: 0 12px 12px 26px;
+      padding: 0 12px 12px 12px;
       display: grid;
       gap: 10px;
     }
@@ -315,6 +310,7 @@ HOME_PAGE = """<!doctype html>
       .panel {
         border-radius: 18px;
         padding: 16px;
+        overflow-x: auto;
       }
       .tree-children {
         padding-left: 16px;
@@ -331,49 +327,47 @@ HOME_PAGE = """<!doctype html>
       <p>哔哩哔哩：<a href="https://space.bilibili.com/9992930" target="_blank">郑羊羊</a> | 项目开源：<a href="https://github.com/zanjie1999/meFileServer" target="_blank">GitHub</a></p>
     </section>
 
-    <div class="grid">
-      <section class="panel">
-        <h2>上传</h2>
-        <p>已存在目录会自动合并，已存在文件会跳过</p>
-        <div class="row">
-          <input id="single-file-input" type="file" multiple hidden>
-          <button id="upload-file-btn" type="button">上传文件</button>
-          <button id="upload-folder-btn" type="button" class="secondary">上传文件夹</button>
-        </div>
-        <div class="row upload-target-box">
-          <span class="upload-target-label">当前上传到：</span>
-          <code id="upload-target-path">/</code>
-          <button id="reset-upload-target-btn" type="button" class="light">切回根目录</button>
-        </div>
-        <div class="hint">文件夹上传和下载依赖Chromium的目录访问API，建议使用Google Chrome浏览器或者Microsoft Edge浏览器</div>
-        <div id="status" class="status"></div>
-        <div class="progress-group">
-          <div class="progress-block">
-            <div class="progress-head">
-              <strong>当前文件</strong>
-              <span id="current-progress-text" class="meta">尚未开始</span>
-            </div>
-            <progress id="current-progress" value="0" max="1"></progress>
+    <section class="panel">
+      <h2>上传</h2>
+      <p>已存在目录会自动合并，已存在文件会跳过</p>
+      <div class="row">
+        <input id="single-file-input" type="file" multiple hidden>
+        <button id="upload-file-btn" type="button">上传文件</button>
+        <button id="upload-folder-btn" type="button" class="secondary">上传文件夹</button>
+      </div>
+      <div class="row upload-target-box">
+        <span class="upload-target-label">当前上传到：</span>
+        <code id="upload-target-path">/</code>
+        <button id="reset-upload-target-btn" type="button" class="light">切回根目录</button>
+      </div>
+      <div class="hint">文件夹上传和下载依赖Chromium的目录访问API，建议使用Google Chrome浏览器或者Microsoft Edge浏览器</div>
+      <div id="status" class="status">等待上传</div>
+      <div class="progress-group">
+        <div class="progress-block">
+          <div class="progress-head">
+            <strong>当前文件</strong>
+            <span id="current-progress-text" class="meta">尚未开始</span>
           </div>
-          <div class="progress-block">
-            <div class="progress-head">
-              <strong>整体进度</strong>
-              <span id="task-progress-text" class="meta">暂无任务</span>
-            </div>
-            <progress id="task-progress" value="0" max="1"></progress>
-          </div>
+          <progress id="current-progress" value="0" max="1"></progress>
         </div>
-      </section>
+        <div class="progress-block">
+          <div class="progress-head">
+            <strong>整体进度</strong>
+            <span id="task-progress-text" class="meta">暂无任务</span>
+          </div>
+          <progress id="task-progress" value="0" max="1"></progress>
+        </div>
+      </div>
+    </section>
 
-      <section class="panel">
-        <h2>下载</h2>
-        <p>点击文件名可以直接下载，点击目录上的“上传到这”可以切换上传目录</p>
-        <div id="tree-empty" class="empty" hidden>目录为空</div>
-        <div class="tree-browser">
-          <div id="tree-root" class="tree-root"></div>
-        </div>
-      </section>
-    </div>
+    <section class="panel">
+      <h2>下载</h2>
+      <p>点击文件名可以直接下载，点击目录上的“上传到这”可以切换上传目录</p>
+      <div id="tree-empty" class="empty" hidden>目录为空</div>
+      <div class="tree-browser">
+        <div id="tree-root" class="tree-root"></div>
+      </div>
+    </section>
   </main>
 
   <script>
@@ -861,7 +855,7 @@ HOME_PAGE = """<!doctype html>
         return;
       }
       if (typeof window.showDirectoryPicker !== "function") {
-        setStatus("当前浏览器不支持选择文件夹上传。请使用 Chromium，并尽量通过 localhost 或安全上下文访问。", true);
+        setStatus("当前浏览器不支持选择文件夹上传。请使用Chromium内核浏览器", true);
         return;
       }
 
@@ -947,7 +941,7 @@ HOME_PAGE = """<!doctype html>
         return;
       }
       if (typeof window.showDirectoryPicker !== "function") {
-        setStatus("当前浏览器不支持把目录直接写入本地路径。请使用 Chromium，并尽量通过 localhost 或安全上下文访问。", true);
+        setStatus("当前浏览器不支持选择文件夹上传。请使用Chromium内核浏览器", true);
         return;
       }
 
