@@ -184,7 +184,7 @@ HOME_PAGE = """<!doctype html>
       margin-top: 14px;
       display: grid;
       gap: 10px;
-      overflow: scroll;
+      overflow-x: auto;
     }
     .progress-block {
       display: grid;
