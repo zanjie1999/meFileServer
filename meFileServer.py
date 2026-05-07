@@ -27,10 +27,11 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 
-VER = "v2.2"
+VER = "v2.3"
 SIDECAR_SUFFIX = ".mefs"
 UPLOAD_READ_CHUNK = 64 * 1024
 PROGRESS_FLUSH_BYTES = 1024 * 1024
+UPLOAD_SOCKET_TIMEOUT_SECONDS = 120
 DOWNLOAD_CHUNK = 1024 * 1024
 SESSION_COOKIE_NAME = "session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
@@ -436,6 +437,9 @@ HOME_PAGE = """<!doctype html>
   <script>
     const chunkSize = 8 * 1024 * 1024;
     const retryDelaySeconds = 10;
+    const uploadStallTimeoutMs = 60 * 1000;
+    const uploadSpeedWindowMs = 5 * 1000;
+    const uploadProgressRenderIntervalMs = 100;
     const retryableUploadStatusCodes = new Set([408, 429, 500, 502, 503, 504]);
 
     const singleFileInput = document.getElementById("single-file-input");
@@ -464,6 +468,7 @@ HOME_PAGE = """<!doctype html>
     let currentBrowsePath = "";
     let currentBrowseDirectory = null;
     let rootDirectoryName = "根目录";
+    let uploadInProgress = false;
     const directoryCache = new Map();
     let uploadMetrics = createEmptyUploadMetrics();
 
@@ -553,7 +558,7 @@ HOME_PAGE = """<!doctype html>
     function createEmptyUploadMetrics() {
       return {
         taskStartedAt: 0,
-        uploadedBytes: 0,
+        taskSamples: [],
         currentFile: null,
       };
     }
@@ -565,40 +570,55 @@ HOME_PAGE = """<!doctype html>
     function startUploadMetrics() {
       uploadMetrics = createEmptyUploadMetrics();
       uploadMetrics.taskStartedAt = performance.now();
+      uploadMetrics.taskSamples = [{ time: uploadMetrics.taskStartedAt, bytes: 0 }];
     }
 
-    function restartCurrentUploadMetrics(path, offset) {
+    function restartCurrentUploadMetrics(path, offset, taskDoneBytes = offset) {
+      const now = performance.now();
       uploadMetrics.currentFile = {
         path,
         startOffset: offset,
-        uploadedBytes: 0,
-        startedAt: performance.now(),
+        samples: [{ time: now, bytes: offset }],
+        lastRenderedAt: 0,
       };
+      uploadMetrics.taskSamples = [{ time: now, bytes: taskDoneBytes }];
     }
 
     function clearCurrentUploadMetrics() {
       uploadMetrics.currentFile = null;
     }
 
-    function recordUploadedBytes(delta) {
-      if (!Number.isFinite(delta) || delta <= 0) {
-        return;
-      }
-      uploadMetrics.uploadedBytes += delta;
-      if (uploadMetrics.currentFile) {
-        uploadMetrics.currentFile.uploadedBytes += delta;
+    function trimUploadSamples(samples, now = performance.now()) {
+      while (samples.length > 1 && now - samples[0].time > uploadSpeedWindowMs) {
+        samples.shift();
       }
     }
 
-    function calculateSpeed(uploadedBytes, startedAt) {
-      if (!startedAt || !Number.isFinite(uploadedBytes) || uploadedBytes <= 0) {
+    function recordUploadSample(currentFileDone, taskDoneBytes) {
+      const now = performance.now();
+      if (!Number.isFinite(currentFileDone) || !Number.isFinite(taskDoneBytes)) {
+        return;
+      }
+      if (uploadMetrics.currentFile) {
+        uploadMetrics.currentFile.samples.push({ time: now, bytes: currentFileDone });
+        trimUploadSamples(uploadMetrics.currentFile.samples, now);
+      }
+      uploadMetrics.taskSamples.push({ time: now, bytes: taskDoneBytes });
+      trimUploadSamples(uploadMetrics.taskSamples, now);
+    }
+
+    function calculateSpeed(samples) {
+      if (!Array.isArray(samples) || samples.length < 2) {
         return 0;
       }
-      const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0);
+      const first = samples[0];
+      const last = samples[samples.length - 1];
+      const elapsedSeconds = Math.max((last.time - first.time) / 1000, 0);
       if (elapsedSeconds < 0.3) {
         return 0;
       }
-      return uploadedBytes / elapsedSeconds;
+      const bytes = last.bytes - first.bytes;
+      return bytes > 0 ? bytes / elapsedSeconds : 0;
     }
 
     function getCurrentUploadStats(done, total) {
@@ -606,7 +626,7 @@ HOME_PAGE = """<!doctype html>
         return null;
       }
       return {
-        speedBytesPerSecond: calculateSpeed(uploadMetrics.currentFile.uploadedBytes, uploadMetrics.currentFile.startedAt),
+        speedBytesPerSecond: calculateSpeed(uploadMetrics.currentFile.samples),
         remainingBytes: Math.max(total - done, 0),
       };
     }
@@ -616,7 +636,7 @@ HOME_PAGE = """<!doctype html>
         return null;
       }
       return {
-        speedBytesPerSecond: calculateSpeed(uploadMetrics.uploadedBytes, uploadMetrics.taskStartedAt),
+        speedBytesPerSecond: calculateSpeed(uploadMetrics.taskSamples),
         remainingBytes: Math.max(totalBytes - doneBytes, 0),
       };
     }
@@ -725,6 +745,36 @@ HOME_PAGE = """<!doctype html>
       setTaskProgress(0, 0, 0, 0, 0);
     }
 
+    function updateLiveUploadProgress({
+      task,
+      fileDone,
+      totalBytes,
+      taskDoneBytes,
+      completedFiles,
+      skippedFiles,
+      totalFiles,
+      force = false,
+    }) {
+      if (!uploadMetrics.currentFile) {
+        return;
+      }
+      recordUploadSample(fileDone, taskDoneBytes);
+      const now = performance.now();
+      if (!force && now - uploadMetrics.currentFile.lastRenderedAt < uploadProgressRenderIntervalMs) {
+        return;
+      }
+      uploadMetrics.currentFile.lastRenderedAt = now;
+      setCurrentProgress(fileDone, task.file.size, `正在上传：${task.path}`, getCurrentUploadStats(fileDone, task.file.size));
+      setTaskProgress(
+        taskDoneBytes,
+        totalBytes,
+        completedFiles,
+        skippedFiles,
+        totalFiles,
+        getTaskUploadStats(taskDoneBytes, totalBytes),
+      );
+    }
+
     function setBusyState(nextBusy) {
       busy = nextBusy;
       singleFileInput.disabled = nextBusy;
@@ -778,6 +828,21 @@ HOME_PAGE = """<!doctype html>
           const detail = error && error.message ? `：${error.message}` : "";
           await waitForRetryCountdown(`${label}失败${detail}`, retryCount);
         }
+      }
+    }
+
+    function isRetryableUploadError(error) {
+      return error && error.retryable === true;
+    }
+
+    function parseJsonPayload(text) {
+      if (!text) {
+        return {};
+      }
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        return { message: text };
       }
     }
 
@@ -1096,17 +1161,98 @@ HOME_PAGE = """<!doctype html>
       });
     }
 
-    async function uploadChunk(task, start, end) {
+    function uploadChunkOnce(task, start, end, onProgress) {
       const body = task.file.slice(start, end);
-      return fetchUploadJsonWithRetry(`/api/upload?path=${encodeURIComponent(task.path)}`, {
-        method: "POST",
-        headers: {
-          "X-Start-Offset": String(start),
-          "X-File-Size": String(task.file.size),
-          "X-File-Mtime": String(task.file.lastModified),
-        },
-        body,
-      }, `上传 ${task.path}`);
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let settled = false;
+        let lastActivityAt = performance.now();
+
+        const cleanup = () => {
+          settled = true;
+          window.clearInterval(stallTimer);
+        };
+        const markActivity = () => {
+          lastActivityAt = performance.now();
+        };
+        const createRetryableError = (message) => {
+          const error = new Error(message);
+          error.retryable = true;
+          return error;
+        };
+
+        const stallTimer = window.setInterval(() => {
+          if (settled) {
+            return;
+          }
+          if (performance.now() - lastActivityAt >= uploadStallTimeoutMs) {
+            xhr.abort();
+            cleanup();
+            reject(createRetryableError("上传连接长时间没有进度，已中止并准备续传"));
+          }
+        }, 1000);
+
+        xhr.open("POST", `/api/upload?path=${encodeURIComponent(task.path)}`);
+        xhr.setRequestHeader("X-Start-Offset", String(start));
+        xhr.setRequestHeader("X-File-Size", String(task.file.size));
+        xhr.setRequestHeader("X-File-Mtime", String(task.file.lastModified));
+
+        xhr.upload.addEventListener("progress", (event) => {
+          markActivity();
+          if (Number.isFinite(event.loaded) && typeof onProgress === "function") {
+            onProgress(Math.min(start + event.loaded, end), false);
+          }
+        });
+        xhr.addEventListener("load", () => {
+          cleanup();
+          const response = {
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            statusText: xhr.statusText,
+          };
+          resolve({ response, payload: parseJsonPayload(xhr.responseText || "") });
+        });
+        xhr.addEventListener("error", () => {
+          cleanup();
+          reject(createRetryableError("网络连接中断"));
+        });
+        xhr.addEventListener("abort", () => {
+          if (settled) {
+            return;
+          }
+          cleanup();
+          reject(createRetryableError("上传请求已中止"));
+        });
+        xhr.addEventListener("timeout", () => {
+          cleanup();
+          reject(createRetryableError("上传请求超时"));
+        });
+
+        markActivity();
+        xhr.send(body);
+      });
+    }
+
+    async function uploadChunk(task, start, end, onProgress) {
+      let retryCount = 0;
+      while (true) {
+        try {
+          const result = await uploadChunkOnce(task, start, end, onProgress);
+          if (!isRetryableUploadResponse(result.response)) {
+            return result;
+          }
+          retryCount += 1;
+          const detail = result.payload && result.payload.message ? `：${result.payload.message}` : "";
+          await waitForRetryCountdown(`上传 ${task.path}失败${detail}`, retryCount);
+        } catch (error) {
+          if (!isRetryableUploadError(error)) {
+            throw error;
+          }
+          retryCount += 1;
+          const detail = error && error.message ? `：${error.message}` : "";
+          await waitForRetryCountdown(`上传 ${task.path}失败${detail}`, retryCount);
+        }
+      }
     }
 
     async function probeTask(task) {
@@ -1141,6 +1287,45 @@ HOME_PAGE = """<!doctype html>
       return payload;
     }
 
+    function buildUploadConfirmMessage({ taskLabel, targetPath, tasks, directoryPaths = [] }) {
+      const totalFiles = tasks.length;
+      const totalBytes = tasks.reduce((sum, item) => sum + item.file.size, 0);
+      const filePreviewPaths = tasks.slice(0, 5).map((task) => `- ${getDisplayPath(task.path)}`);
+      const directoryPreviewPaths = directoryPaths.slice(0, Math.max(5 - filePreviewPaths.length, 0)).map((path) => `- ${getDisplayPath(path)}/`);
+      const previewPaths = [...filePreviewPaths, ...directoryPreviewPaths];
+      const omittedCount = Math.max(totalFiles + directoryPaths.length - previewPaths.length, 0);
+      const lines = [
+        `确认开始${taskLabel}？`,
+        "",
+        `目标目录：${getDisplayPath(targetPath)}`,
+        `文件数量：${totalFiles}`,
+        `总大小：${formatBytes(totalBytes)}`,
+        "",
+        "将上传到：",
+        ...previewPaths,
+      ];
+      if (omittedCount > 0) {
+        lines.push(`... 还有 ${omittedCount} 项`);
+      }
+      return lines.join("\\n");
+    }
+
+    function confirmUploadTasks(tasks, taskLabel, { directoryPaths = [] } = {}) {
+      if (!tasks.length && !directoryPaths.length) {
+        return true;
+      }
+      const confirmed = window.confirm(buildUploadConfirmMessage({
+        taskLabel,
+        targetPath: currentUploadPath,
+        tasks,
+        directoryPaths,
+      }));
+      if (!confirmed) {
+        setStatus(`已取消上传到：${getDisplayPath(currentUploadPath)}`);
+      }
+      return confirmed;
+    }
+
     async function runUploadTasks(tasks, taskLabel) {
       if (!tasks.length) {
         clearDirectoryCache();
@@ -1150,6 +1335,7 @@ HOME_PAGE = """<!doctype html>
       }
 
       setBusyState(true);
+      uploadInProgress = true;
       startUploadMetrics();
       const totalFiles = tasks.length;
       const totalBytes = tasks.reduce((sum, item) => sum + item.file.size, 0);
@@ -1189,7 +1375,7 @@ HOME_PAGE = """<!doctype html>
           }
 
           let offset = Number(probePayload.offset || 0);
-          restartCurrentUploadMetrics(task.path, offset);
+          restartCurrentUploadMetrics(task.path, offset, completedBytes + offset);
           setCurrentProgress(offset, task.file.size, `准备上传：${task.path}`, getCurrentUploadStats(offset, task.file.size));
           setTaskProgress(
             completedBytes + offset,
@@ -1201,7 +1387,7 @@ HOME_PAGE = """<!doctype html>
           );
 
           if (task.file.size === 0) {
-            const { response, payload } = await uploadChunk(task, 0, 0);
+            const { response, payload } = await uploadChunk(task, 0, 0, null);
             if (!response.ok) {
               throw new Error(payload.message || `上传失败（${response.status}）`);
             }
@@ -1222,7 +1408,18 @@ HOME_PAGE = """<!doctype html>
           while (offset < task.file.size) {
             const end = Math.min(offset + chunkSize, task.file.size);
             setStatus(`正在上传：${task.path}`);
-            const { response, payload } = await uploadChunk(task, offset, end);
+            const { response, payload } = await uploadChunk(task, offset, end, (fileDone, force = false) => {
+              updateLiveUploadProgress({
+                task,
+                fileDone,
+                totalBytes,
+                taskDoneBytes: completedBytes + fileDone,
+                completedFiles,
+                skippedFiles,
+                totalFiles,
+                force,
+              });
+            });
 
             if (response.status === 409) {
               if (payload.status === "冲突") {
@@ -1232,7 +1429,7 @@ HOME_PAGE = """<!doctype html>
                 throw new Error(`${task.path}：服务器返回了无效的续传位置。`);
               }
               offset = payload.offset;
-              restartCurrentUploadMetrics(task.path, offset);
+              restartCurrentUploadMetrics(task.path, offset, completedBytes + offset);
               setStatus(`已同步服务端进度，继续上传：${task.path}`);
               setCurrentProgress(offset, task.file.size, `继续上传：${task.path}`, getCurrentUploadStats(offset, task.file.size));
               setTaskProgress(
@@ -1251,17 +1448,17 @@ HOME_PAGE = """<!doctype html>
             }
 
             const nextOffset = Number(payload.offset || end);
-            recordUploadedBytes(nextOffset - offset);
             offset = nextOffset;
-            setCurrentProgress(offset, task.file.size, `正在上传：${task.path}`, getCurrentUploadStats(offset, task.file.size));
-            setTaskProgress(
-              completedBytes + offset,
+            updateLiveUploadProgress({
+              task,
+              fileDone: offset,
               totalBytes,
               completedFiles,
               skippedFiles,
               totalFiles,
-              getTaskUploadStats(completedBytes + offset, totalBytes),
-            );
+              taskDoneBytes: completedBytes + offset,
+              force: true,
+            });
           }
 
           completedFiles += 1;
@@ -1286,6 +1483,7 @@ HOME_PAGE = """<!doctype html>
         throw error;
       } finally {
         clearCurrentUploadMetrics();
+        uploadInProgress = false;
         setBusyState(false);
       }
     }
@@ -1309,6 +1507,9 @@ HOME_PAGE = """<!doctype html>
         return;
       }
       const tasks = files.map((file) => ({ path: joinUploadPath(currentUploadPath, file.name), file }));
+      if (!confirmUploadTasks(tasks, "文件上传")) {
+        return;
+      }
       try {
         await runUploadTasks(tasks, "文件上传");
       } catch (_) {
@@ -1377,6 +1578,9 @@ HOME_PAGE = """<!doctype html>
       }
 
       try {
+        if (!confirmUploadTasks(collected.files, `文件夹 ${collected.rootPath} 上传`)) {
+          return;
+        }
         const directories = collected.directories.map((path) => joinUploadPath(currentUploadPath, path));
         await ensureRemoteDirectories(directories);
         await runUploadTasks(collected.files, `文件夹 ${collected.rootPath} 上传`);
@@ -1507,6 +1711,9 @@ HOME_PAGE = """<!doctype html>
           path: joinUploadPath(currentUploadPath, item.path),
           file: item.file,
         }));
+        if (!confirmUploadTasks(files, `文件夹 ${collected.rootPath} 上传`, { directoryPaths: directories })) {
+          return;
+        }
         await ensureRemoteDirectories(directories);
         if (!files.length) {
           clearDirectoryCache();
@@ -1742,6 +1949,13 @@ HOME_PAGE = """<!doctype html>
       setUploadTarget(currentBrowsePath);
     });
     downloadCurrentButton.addEventListener("click", downloadCurrentDirectory);
+    window.addEventListener("beforeunload", (event) => {
+      if (!uploadInProgress) {
+        return;
+      }
+      event.preventDefault();
+      event.returnValue = "";
+    });
 
     resetProgress();
     setBusyState(false);
@@ -2698,12 +2912,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             atomic_write_sidecar(file_path, size=file_size, mtime_ms=file_mtime, received=current_offset)
 
             mode = "r+b" if file_path.exists() and file_path.is_file() else "w+b"
+            previous_timeout = self.connection.gettimeout()
+            self.connection.settimeout(UPLOAD_SOCKET_TIMEOUT_SECONDS)
             try:
                 with file_path.open(mode) as handle:
                     handle.seek(start_offset)
                     remaining = content_length
                     while remaining > 0:
-                        chunk = self.rfile.read(min(UPLOAD_READ_CHUNK, remaining))
+                        try:
+                            chunk = self.rfile.read(min(UPLOAD_READ_CHUNK, remaining))
+                        except TimeoutError as exc:
+                            raise ConnectionError("上传连接长时间没有数据，已保存当前进度") from exc
+                        except socket.timeout as exc:
+                            raise ConnectionError("上传连接长时间没有数据，已保存当前进度") from exc
                         if not chunk:
                             raise ConnectionError("客户端在上传过程中断开了连接")
                         handle.write(chunk)
@@ -2734,7 +2955,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             except ConnectionError:
                 final_offset = start_offset + bytes_written
                 atomic_write_sidecar(file_path, size=file_size, mtime_ms=file_mtime, received=final_offset)
-                raise
+                self.close_connection = True
+                return
+            finally:
+                self.connection.settimeout(previous_timeout)
 
         self.send_json(HTTPStatus.OK, response)
 
