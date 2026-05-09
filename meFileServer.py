@@ -4,30 +4,38 @@
 # zyyme 20260419
 
 import argparse
+import base64
+import binascii
 import datetime as dt
+import email.utils
 import errno
 import getpass
+import hashlib
 import html
 import json
 import mimetypes
 import os
+import re
 import secrets
+import shutil
 import socket
 import stat
 import sys
 import threading
 import time
 import traceback
+import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
-VER = "v2.3"
+VER = "v3.0"
 SIDECAR_SUFFIX = ".mefs"
 UPLOAD_READ_CHUNK = 64 * 1024
 PROGRESS_FLUSH_BYTES = 1024 * 1024
@@ -35,6 +43,36 @@ UPLOAD_SOCKET_TIMEOUT_SECONDS = 120
 DOWNLOAD_CHUNK = 1024 * 1024
 SESSION_COOKIE_NAME = "session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
+DAV_PREFIX = "/dav"
+DAV_ROOT_PATH = DAV_PREFIX + "/"
+DAV_REALM = "meFileServer WebDAV"
+DAV_TIMEOUT_SECONDS = 30 * 60
+DAV_DIGEST_NONCE_TTL_SECONDS = 10 * 60
+DAV_WRITE_CHUNK = 1024 * 1024
+DAV_METHODS = ("OPTIONS", "HEAD", "GET", "PROPFIND", "PUT", "MKCOL", "DELETE", "COPY", "MOVE", "PROPPATCH", "LOCK", "UNLOCK")
+DAV_ALLOW_MISSING = "OPTIONS, LOCK, PUT, MKCOL"
+DAV_ALLOW_DIR = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
+DAV_ALLOW_FILE = "OPTIONS, LOCK, GET, HEAD, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT"
+DAV_ALLOW_HEADER = ", ".join(DAV_METHODS)
+DAV_COMPLIANCE_HEADER = "1, 2"
+DAV_NS = "DAV:"
+MS_DAV_NS = "urn:schemas-microsoft-com:"
+MS_OFFICE_NS = "urn:schemas-microsoft-com:office:office"
+MS_REPL_NS = "http://schemas.microsoft.com/repl/"
+DAV_XML_NAMESPACE_PREFIXES = {
+    DAV_NS: "D",
+    MS_DAV_NS: "Z",
+    MS_OFFICE_NS: "Office",
+    MS_REPL_NS: "Repl",
+}
+HTTP_MULTI_STATUS = 207
+HTTP_LOCKED = 423
+HTTP_INSUFFICIENT_STORAGE = 507
+
+ET.register_namespace("D", DAV_NS)
+ET.register_namespace("Z", MS_DAV_NS)
+ET.register_namespace("Office", MS_OFFICE_NS)
+ET.register_namespace("Repl", MS_REPL_NS)
 
 HOME_PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -378,6 +416,7 @@ HOME_PAGE = """<!doctype html>
     <section class="panel hero">
       <h1>咩FileServer</h1>
       <p>当前共享根目录：<code>__ROOT__</code></p>
+      <p>WebDAV 挂载路径：<code>__WEBDAV__</code></p>
       <p>单文件文件服务器 支持文件目录断点续传上传下载</p>
       <p>哔哩哔哩：<a href="https://space.bilibili.com/9992930" target="_blank">郑羊羊</a> | 项目开源：<a href="https://github.com/zanjie1999/meFileServer" target="_blank">GitHub</a></p>
     </section>
@@ -2066,6 +2105,10 @@ class AppState:
     session_lock: threading.Lock = field(default_factory=threading.Lock)
     file_locks: dict[str, threading.Lock] = field(default_factory=dict)
     file_locks_lock: threading.Lock = field(default_factory=threading.Lock)
+    dav_locks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    dav_locks_lock: threading.Lock = field(default_factory=threading.Lock)
+    dav_digest_nonces: dict[str, float] = field(default_factory=dict)
+    dav_digest_nonce_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def auth_enabled(self) -> bool:
         return bool(self.password)
@@ -2096,6 +2139,102 @@ class AppState:
                 lock = threading.Lock()
                 self.file_locks[relative_path] = lock
             return lock
+
+    def cleanup_dav_locks(self) -> None:
+        now = time.time()
+        expired: list[str] = []
+        for path, lock_info in self.dav_locks.items():
+            if float(lock_info.get("expires_at", 0)) <= now:
+                expired.append(path)
+        for path in expired:
+            self.dav_locks.pop(path, None)
+
+    def find_dav_lock(self, relative_path: str) -> tuple[str, dict[str, Any]] | None:
+        with self.dav_locks_lock:
+            self.cleanup_dav_locks()
+            path_parts = split_relative_path(relative_path)
+            candidates = [""] + ["/".join(path_parts[:index]) for index in range(1, len(path_parts) + 1)]
+            for candidate in reversed(candidates):
+                lock_info = self.dav_locks.get(candidate)
+                if lock_info is not None:
+                    depth = str(lock_info.get("depth", "infinity")).lower()
+                    if depth == "0" and candidate != relative_path:
+                        continue
+                    return candidate, lock_info
+        return None
+
+    def dav_path_locked(self, relative_path: str, submitted_tokens: set[str]) -> bool:
+        found = self.find_dav_lock(relative_path)
+        if found is None:
+            return False
+        _, lock_info = found
+        return str(lock_info.get("token", "")) not in submitted_tokens
+
+    def dav_subtree_locked(self, relative_path: str, submitted_tokens: set[str]) -> bool:
+        with self.dav_locks_lock:
+            self.cleanup_dav_locks()
+            for lock_path, lock_info in self.dav_locks.items():
+                depth = str(lock_info.get("depth", "infinity")).lower()
+                lock_in_target_subtree = dav_is_same_or_child_path(lock_path, relative_path)
+                lock_covers_target = depth != "0" and dav_is_same_or_child_path(relative_path, lock_path)
+                if (lock_in_target_subtree or lock_covers_target) and str(lock_info.get("token", "")) not in submitted_tokens:
+                    return True
+        return False
+
+    def create_dav_lock(
+        self,
+        relative_path: str,
+        owner: str = "",
+        timeout_seconds: int = DAV_TIMEOUT_SECONDS,
+        depth: str = "infinity",
+    ) -> dict[str, Any]:
+        token = f"opaquelocktoken:{uuid.uuid4()}"
+        lock_info = {
+            "token": token,
+            "owner": owner,
+            "depth": depth,
+            "created_at": time.time(),
+            "expires_at": time.time() + timeout_seconds,
+            "timeout": timeout_seconds,
+        }
+        with self.dav_locks_lock:
+            self.cleanup_dav_locks()
+            self.dav_locks[relative_path] = lock_info
+        return lock_info
+
+    def remove_dav_lock(self, relative_path: str, token: str) -> bool:
+        with self.dav_locks_lock:
+            self.cleanup_dav_locks()
+            lock_info = self.dav_locks.get(relative_path)
+            if lock_info is None or str(lock_info.get("token", "")) != token:
+                return False
+            self.dav_locks.pop(relative_path, None)
+            return True
+
+    def create_dav_digest_nonce(self) -> str:
+        nonce = secrets.token_urlsafe(24)
+        expires_at = time.time() + DAV_DIGEST_NONCE_TTL_SECONDS
+        with self.dav_digest_nonce_lock:
+            self.cleanup_dav_digest_nonces()
+            self.dav_digest_nonces[nonce] = expires_at
+        return nonce
+
+    def validate_dav_digest_nonce(self, nonce: str) -> bool:
+        now = time.time()
+        with self.dav_digest_nonce_lock:
+            self.cleanup_dav_digest_nonces()
+            expires_at = self.dav_digest_nonces.get(nonce)
+            if expires_at is None or expires_at < now:
+                self.dav_digest_nonces.pop(nonce, None)
+                return False
+            self.dav_digest_nonces[nonce] = now + DAV_DIGEST_NONCE_TTL_SECONDS
+            return True
+
+    def cleanup_dav_digest_nonces(self) -> None:
+        now = time.time()
+        expired = [nonce for nonce, expires_at in self.dav_digest_nonces.items() if expires_at < now]
+        for nonce in expired:
+            self.dav_digest_nonces.pop(nonce, None)
 
 
 class MeFileHTTPServer(ThreadingHTTPServer):
@@ -2134,7 +2273,7 @@ def display_root_name(root: Path) -> str:
 def normalize_relative_path(raw_path: str, *, allow_empty: bool = False) -> str:
     if raw_path is None:
         raise ValueError("路径不能为空")
-    value = str(raw_path).strip().replace("\\\\", "/")
+    value = str(raw_path).strip().replace("\\", "/")
     drive, _ = os.path.splitdrive(value)
     if drive:
         raise ValueError("不允许使用绝对路径")
@@ -2483,6 +2622,373 @@ def parse_single_range(header_value: str, file_size: int) -> tuple[int, int] | N
         return None
 
 
+def is_dav_request_path(path: str) -> bool:
+    return path == DAV_PREFIX or path.startswith(DAV_ROOT_PATH)
+
+
+def dav_relative_path_from_url_path(path: str, *, allow_empty: bool = True) -> str:
+    if path == DAV_PREFIX:
+        return ""
+    if not path.startswith(DAV_ROOT_PATH):
+        raise ValueError("不是 WebDAV 路径")
+    raw_relative = unquote(path[len(DAV_ROOT_PATH) :])
+    if raw_relative.endswith("/"):
+        raw_relative = raw_relative.rstrip("/")
+    return normalize_relative_path(raw_relative, allow_empty=allow_empty)
+
+
+def dav_href(relative_path: str, *, is_directory: bool = False, base_url: str = "") -> str:
+    if not relative_path:
+        href = DAV_ROOT_PATH
+        return base_url.rstrip("/") + href if base_url else href
+    href = DAV_ROOT_PATH + quote(relative_path, safe="/")
+    if is_directory and not href.endswith("/"):
+        href += "/"
+    return base_url.rstrip("/") + href if base_url else href
+
+
+def dav_http_date(timestamp: float) -> str:
+    return email.utils.formatdate(timestamp, usegmt=True)
+
+
+def dav_creation_date(timestamp: float) -> str:
+    return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def dav_creation_date_for_user_agent(timestamp: float, user_agent: str) -> str:
+    if "microsoft-webdav" in user_agent.lower():
+        return dav_http_date(timestamp)
+    return dav_creation_date(timestamp)
+
+
+def dav_xml_response_body(root: ET.Element) -> bytes:
+    body = ET.tostring(root, encoding="utf-8", xml_declaration=False)
+    return b'<?xml version="1.0" encoding="UTF-8"?>' + body
+
+
+def dav_xml_text_escape(value: str) -> str:
+    return html.escape(value, quote=False)
+
+
+def dav_xml_attr_escape(value: str) -> str:
+    return html.escape(value, quote=True)
+
+
+def dav_clark_to_prefixed_name(tag: str) -> str:
+    if tag.startswith("{"):
+        namespace, _, local_name = tag[1:].partition("}")
+        prefix = DAV_XML_NAMESPACE_PREFIXES.get(namespace)
+        if prefix:
+            return f"{prefix}:{local_name}"
+    return tag
+
+
+def dav_split_clark_name(tag: str) -> tuple[str, str] | None:
+    if tag.startswith("{"):
+        namespace, separator, local_name = tag[1:].partition("}")
+        if separator:
+            return namespace, local_name
+    return None
+
+
+def dav_collect_dynamic_namespaces(element: ET.Element, namespaces: dict[str, str]) -> None:
+    for tag in [element.tag, *element.attrib.keys()]:
+        split_name = dav_split_clark_name(tag)
+        if split_name is None:
+            continue
+        namespace, _ = split_name
+        if namespace not in DAV_XML_NAMESPACE_PREFIXES and namespace not in namespaces:
+            namespaces[namespace] = f"N{len(namespaces) + 1}"
+    for child in list(element):
+        dav_collect_dynamic_namespaces(child, namespaces)
+
+
+def dav_prefixed_xml_name(tag: str, dynamic_namespaces: dict[str, str]) -> str:
+    split_name = dav_split_clark_name(tag)
+    if split_name is None:
+        return tag
+    namespace, local_name = split_name
+    prefix = DAV_XML_NAMESPACE_PREFIXES.get(namespace) or dynamic_namespaces.get(namespace)
+    if prefix:
+        return f"{prefix}:{local_name}"
+    return local_name
+
+
+def dav_serialize_xml_element(element: ET.Element, dynamic_namespaces: dict[str, str]) -> str:
+    name = dav_prefixed_xml_name(element.tag, dynamic_namespaces)
+    attrs = "".join(
+        f' {dav_prefixed_xml_name(key, dynamic_namespaces)}="{dav_xml_attr_escape(str(value))}"'
+        for key, value in element.attrib.items()
+    )
+    children = list(element)
+    text = element.text or ""
+    if not children and text == "":
+        return f"<{name}{attrs}/>"
+    body = dav_xml_text_escape(text)
+    for child in children:
+        body += dav_serialize_xml_element(child, dynamic_namespaces)
+        if child.tail:
+            body += dav_xml_text_escape(child.tail)
+    return f"<{name}{attrs}>{body}</{name}>"
+
+
+def dav_multistatus_response_body(root: ET.Element) -> bytes:
+    dynamic_namespaces: dict[str, str] = {}
+    for child in list(root):
+        dav_collect_dynamic_namespaces(child, dynamic_namespaces)
+    namespace_declarations = "".join(
+        f' xmlns:{prefix}="{dav_xml_attr_escape(namespace)}"'
+        for namespace, prefix in DAV_XML_NAMESPACE_PREFIXES.items()
+    )
+    namespace_declarations += "".join(
+        f' xmlns:{prefix}="{dav_xml_attr_escape(namespace)}"'
+        for namespace, prefix in dynamic_namespaces.items()
+    )
+    children = "".join(dav_serialize_xml_element(child, dynamic_namespaces) for child in list(root))
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<D:multistatus{namespace_declarations}>"
+        f"{children}</D:multistatus>"
+    )
+    return body.encode("utf-8")
+
+
+def dav_lock_response_body(lock_info: dict[str, Any]) -> bytes:
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>\n'
+        '    <D:locktype><D:write/></D:locktype>\n'
+        '    <D:lockscope><D:exclusive/></D:lockscope>\n'
+        f'    <D:depth>{dav_xml_text_escape(str(lock_info.get("depth", "infinity")))}</D:depth>\n'
+        f'    <D:owner>{dav_xml_text_escape(str(lock_info.get("owner", "")))}</D:owner>\n'
+        f'    <D:timeout>Second-{max(1, int(float(lock_info.get("expires_at", time.time())) - time.time()))}</D:timeout>\n'
+        f'    <D:locktoken><D:href>{dav_xml_text_escape(str(lock_info.get("token", "")))}</D:href></D:locktoken>\n'
+        f'    <D:lockroot><D:href>{dav_xml_text_escape(str(lock_info.get("lockroot_href", "")))}</D:href></D:lockroot>\n'
+        '</D:activelock></D:lockdiscovery></D:prop>'
+    ).encode("utf-8")
+
+
+def dav_live_property_tag_set() -> set[str]:
+    return {
+        dav_clark("resourcetype"),
+        dav_clark("displayname"),
+        dav_clark("getcontentlength"),
+        dav_clark("getlastmodified"),
+        dav_clark("creationdate"),
+        dav_clark("getcontenttype"),
+        dav_clark("getetag"),
+        dav_clark("supportedlock"),
+    }
+
+
+def dav_property_applies_to_path(property_name: str, absolute_path: Path) -> bool:
+    if absolute_path.is_dir():
+        return property_name not in {
+            dav_clark("getcontentlength"),
+            dav_clark("getcontenttype"),
+            dav_clark("getetag"),
+        }
+    return True
+
+
+
+def dav_clark(name: str) -> str:
+    return f"{{{DAV_NS}}}{name}"
+
+
+def ms_dav_clark(name: str) -> str:
+    return f"{{{MS_DAV_NS}}}{name}"
+
+
+def ms_office_clark(name: str) -> str:
+    return f"{{{MS_OFFICE_NS}}}{name}"
+
+
+def ms_repl_clark(name: str) -> str:
+    return f"{{{MS_REPL_NS}}}{name}"
+
+
+def dav_add_text(parent: ET.Element, name: str, text: str) -> ET.Element:
+    child = ET.SubElement(parent, dav_clark(name))
+    child.text = text
+    return child
+
+
+def dav_add_empty(parent: ET.Element, name: str) -> ET.Element:
+    return ET.SubElement(parent, dav_clark(name))
+
+
+def xml_add_text(parent: ET.Element, tag: str, text: str) -> ET.Element:
+    child = ET.SubElement(parent, tag)
+    child.text = text
+    return child
+
+
+def dav_etag(path_stat: os.stat_result) -> str:
+    return f'"{path_stat.st_mtime_ns:x}-{path_stat.st_size:x}"'
+
+
+def dav_status_text(status: int) -> str:
+    try:
+        phrase = HTTPStatus(status).phrase
+    except ValueError:
+        phrase = "Status"
+    return f"HTTP/1.1 {status} {phrase}"
+
+
+def dav_parse_timeout(header_value: str | None) -> int:
+    if not header_value:
+        return DAV_TIMEOUT_SECONDS
+    values = [item.strip().lower() for item in header_value.split(",")]
+    for value in values:
+        if value.startswith("second-"):
+            try:
+                return max(1, min(int(value[7:]), 24 * 60 * 60))
+            except ValueError:
+                continue
+    return DAV_TIMEOUT_SECONDS
+
+
+def dav_time_t(timestamp: float) -> str:
+    return str(max(0, int(timestamp)))
+
+
+def dav_win32_file_time(timestamp: float) -> str:
+    # 100ns intervals since 1601-01-01 UTC.
+    return str(int((timestamp + 11644473600) * 10000000))
+
+
+def dav_extract_owner(body: bytes) -> str:
+    if not body:
+        return ""
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return ""
+    owner = root.find(f".//{dav_clark('owner')}")
+    if owner is None:
+        return ""
+    return "".join(owner.itertext()).strip()
+
+
+def dav_if_header_tokens(header_value: str | None) -> set[str]:
+    if not header_value:
+        return set()
+    return {match.group(1) for match in re.finditer(r"<(opaquelocktoken:[^>]+)>", header_value)}
+
+
+def dav_lock_token_header_value(header_value: str | None) -> str:
+    if not header_value:
+        return ""
+    value = header_value.strip()
+    if value.startswith("<") and value.endswith(">"):
+        return value[1:-1]
+    return value
+
+
+def dav_parse_digest_header(header_value: str) -> dict[str, str]:
+    _, _, raw_params = header_value.partition(" ")
+    params: dict[str, str] = {}
+    index = 0
+    length = len(raw_params)
+    while index < length:
+        while index < length and raw_params[index] in " ,\t":
+            index += 1
+        if index >= length:
+            break
+        key_start = index
+        while index < length and raw_params[index] not in " =":
+            index += 1
+        key = raw_params[key_start:index].strip().lower()
+        while index < length and raw_params[index] in " \t":
+            index += 1
+        if index >= length or raw_params[index] != "=":
+            break
+        index += 1
+        while index < length and raw_params[index] in " \t":
+            index += 1
+        if index < length and raw_params[index] == '"':
+            index += 1
+            value_parts: list[str] = []
+            while index < length:
+                char = raw_params[index]
+                if char == "\\" and index + 1 < length:
+                    value_parts.append(raw_params[index + 1])
+                    index += 2
+                    continue
+                if char == '"':
+                    index += 1
+                    break
+                value_parts.append(char)
+                index += 1
+            value = "".join(value_parts)
+        else:
+            value_start = index
+            while index < length and raw_params[index] != ",":
+                index += 1
+            value = raw_params[value_start:index].strip()
+        if key:
+            params[key] = value
+        while index < length and raw_params[index] != ",":
+            index += 1
+        if index < length and raw_params[index] == ",":
+            index += 1
+    return params
+
+
+def dav_md5_hex(value: str) -> str:
+    return hashlib.md5(value.encode("utf-8")).hexdigest()
+
+
+def dav_make_lockdiscovery(lock_info: dict[str, Any]) -> ET.Element:
+    lockdiscovery = ET.Element(dav_clark("lockdiscovery"))
+    activelock = ET.SubElement(lockdiscovery, dav_clark("activelock"))
+    locktype = ET.SubElement(activelock, dav_clark("locktype"))
+    ET.SubElement(locktype, dav_clark("write"))
+    lockscope = ET.SubElement(activelock, dav_clark("lockscope"))
+    ET.SubElement(lockscope, dav_clark("exclusive"))
+    dav_add_text(activelock, "depth", str(lock_info.get("depth", "infinity")))
+    owner_text = str(lock_info.get("owner", ""))
+    if owner_text:
+        dav_add_text(activelock, "owner", owner_text)
+    timeout_seconds = max(1, int(float(lock_info.get("expires_at", time.time())) - time.time()))
+    dav_add_text(activelock, "timeout", f"Second-{timeout_seconds}")
+    locktoken = ET.SubElement(activelock, dav_clark("locktoken"))
+    dav_add_text(locktoken, "href", str(lock_info.get("token", "")))
+    lockroot_href = str(lock_info.get("lockroot_href", ""))
+    if lockroot_href:
+        lockroot = ET.SubElement(activelock, dav_clark("lockroot"))
+        dav_add_text(lockroot, "href", lockroot_href)
+    return lockdiscovery
+
+
+def dav_copy_directory(src: Path, dst: Path) -> None:
+    dst.mkdir()
+    for entry in src.iterdir():
+        if is_sidecar_entry_name(entry.name):
+            continue
+        target = dst / entry.name
+        if entry.is_dir():
+            dav_copy_directory(entry, target)
+        elif entry.is_file():
+            shutil.copy2(entry, target)
+
+
+def dav_is_same_or_child_path(path: str, base_path: str) -> bool:
+    if not base_path:
+        return True
+    return path == base_path or path.startswith(base_path + "/")
+
+
+def dav_add_supportedlock(prop: ET.Element) -> None:
+    supportedlock = ET.SubElement(prop, dav_clark("supportedlock"))
+    lockentry = ET.SubElement(supportedlock, dav_clark("lockentry"))
+    lockscope = ET.SubElement(lockentry, dav_clark("lockscope"))
+    ET.SubElement(lockscope, dav_clark("exclusive"))
+    locktype = ET.SubElement(lockentry, dav_clark("locktype"))
+    ET.SubElement(locktype, dav_clark("write"))
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2490,9 +2996,24 @@ class RequestHandler(BaseHTTPRequestHandler):
     def state(self) -> AppState:
         return self.server.state  # type: ignore[attr-defined]
 
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as exc:
+            if self.is_client_disconnect_error(exc):
+                self.close_connection = True
+                return
+            raise
+
     def do_GET(self) -> None:
         try:
             parsed = urlparse(self.path)
+            if is_dav_request_path(parsed.path):
+                if not self.ensure_dav_authenticated():
+                    return
+                self.handle_dav_get(parsed.path, head_only=False)
+                return
+
             if parsed.path == "/":
                 if self.state.auth_enabled() and not self.is_authenticated():
                     self.send_html(HTTPStatus.OK, render_login_page(""))
@@ -2516,6 +3037,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+                return
+
+            self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应页面")
+        except Exception:
+            self.handle_unexpected_error()
+
+    def do_HEAD(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            if is_dav_request_path(parsed.path):
+                if not self.ensure_dav_authenticated():
+                    return
+                self.handle_dav_get(parsed.path, head_only=True)
+                return
+
+            if parsed.path == "/download":
+                if not self.ensure_authenticated(api=False):
+                    return
+                self.handle_download(parsed.query, head_only=True)
                 return
 
             self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应页面")
@@ -2557,6 +3097,49 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception:
             self.handle_unexpected_error()
 
+    def do_OPTIONS(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            if is_dav_request_path(parsed.path):
+                if not self.ensure_dav_authenticated():
+                    return
+                self.send_dav_options()
+                return
+
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except Exception:
+            self.handle_unexpected_error()
+
+    def do_PROPFIND(self) -> None:
+        self.handle_dav_method(self.handle_dav_propfind)
+
+    def do_PUT(self) -> None:
+        self.handle_dav_method(self.handle_dav_put)
+
+    def do_MKCOL(self) -> None:
+        self.handle_dav_method(self.handle_dav_mkcol)
+
+    def do_DELETE(self) -> None:
+        self.handle_dav_method(self.handle_dav_delete)
+
+    def do_COPY(self) -> None:
+        self.handle_dav_method(self.handle_dav_copy)
+
+    def do_MOVE(self) -> None:
+        self.handle_dav_method(self.handle_dav_move)
+
+    def do_LOCK(self) -> None:
+        self.handle_dav_method(self.handle_dav_lock)
+
+    def do_UNLOCK(self) -> None:
+        self.handle_dav_method(self.handle_dav_unlock)
+
+    def do_PROPPATCH(self) -> None:
+        self.handle_dav_method(self.handle_dav_proppatch)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(
             "%s - - [%s] %s\n"
@@ -2564,11 +3147,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def handle_unexpected_error(self) -> None:
+        if self.is_client_disconnect_error(sys.exc_info()[1]):
+            return
         traceback.print_exc()
         try:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": "服务器内部发生错误"})
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
             pass
+
+    def is_client_disconnect_error(self, exc: BaseException | None) -> bool:
+        while exc is not None:
+            if isinstance(exc, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, TimeoutError, socket.timeout)):
+                return True
+            if isinstance(exc, OSError) and getattr(exc, "winerror", None) in {10053, 10054}:
+                return True
+            exc = exc.__cause__ or exc.__context__
+        return False
 
     def is_authenticated(self) -> bool:
         if not self.state.auth_enabled():
@@ -2595,6 +3189,787 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_error_text(HTTPStatus.UNAUTHORIZED, "需要先登录才能访问该资源")
         return False
 
+    def is_dav_authenticated(self) -> bool:
+        if not self.state.auth_enabled():
+            return True
+        auth_header = self.headers.get("Authorization", "")
+        scheme, _, encoded = auth_header.partition(" ")
+        scheme = scheme.lower()
+        if scheme == "basic":
+            return self.is_dav_basic_authenticated(encoded)
+        if scheme == "digest":
+            return self.is_dav_digest_authenticated(auth_header)
+        return False
+
+    def is_dav_basic_authenticated(self, encoded: str) -> bool:
+        if not encoded.strip():
+            return False
+        try:
+            decoded = base64.b64decode(encoded.strip(), validate=True).decode("utf-8", errors="replace")
+        except (binascii.Error, UnicodeError, ValueError):
+            return False
+        _, _, password = decoded.partition(":")
+        return secrets.compare_digest(password, self.state.password)
+
+    def is_dav_digest_authenticated(self, auth_header: str) -> bool:
+        params = dav_parse_digest_header(auth_header)
+        required = {"username", "realm", "nonce", "uri", "response"}
+        if not required.issubset(params):
+            return False
+        if params["realm"] != DAV_REALM:
+            return False
+        if not self.state.validate_dav_digest_nonce(params["nonce"]):
+            return False
+
+        username = params["username"]
+        method = self.command
+        uri = params["uri"]
+        qop = params.get("qop", "")
+        algorithm = params.get("algorithm", "MD5").lower()
+        if algorithm not in {"md5", ""}:
+            return False
+
+        ha1 = dav_md5_hex(f"{username}:{DAV_REALM}:{self.state.password}")
+        ha2 = dav_md5_hex(f"{method}:{uri}")
+        if qop:
+            if qop != "auth" or not params.get("nc") or not params.get("cnonce"):
+                return False
+            expected = dav_md5_hex(f"{ha1}:{params['nonce']}:{params['nc']}:{params['cnonce']}:{qop}:{ha2}")
+        else:
+            expected = dav_md5_hex(f"{ha1}:{params['nonce']}:{ha2}")
+        return secrets.compare_digest(expected, params["response"])
+
+    def ensure_dav_authenticated(self) -> bool:
+        if self.is_dav_authenticated():
+            return True
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        nonce = self.state.create_dav_digest_nonce()
+        self.send_header(
+            "WWW-Authenticate",
+            f'Digest realm="{DAV_REALM}", nonce="{nonce}", algorithm=MD5, qop="auth"',
+        )
+        self.send_header("WWW-Authenticate", f'Basic realm="{DAV_REALM}"')
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        return False
+
+    def handle_dav_method(self, handler: Any) -> None:
+        try:
+            parsed = urlparse(self.path)
+            if not is_dav_request_path(parsed.path):
+                self.send_error_text(HTTPStatus.NOT_FOUND, "未找到对应接口")
+                return
+            if not self.ensure_dav_authenticated():
+                return
+            handler(parsed.path)
+        except Exception:
+            self.handle_unexpected_error()
+
+    def send_status_no_body(self, status: int | HTTPStatus, extra_headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def send_dav_status_no_body(self, status: int | HTTPStatus, extra_headers: dict[str, str] | None = None) -> None:
+        headers = {"DAV": DAV_COMPLIANCE_HEADER, "MS-Author-Via": "DAV"}
+        if extra_headers:
+            headers.update(extra_headers)
+        self.send_status_no_body(status, headers)
+
+    def send_status_close(self, status: int | HTTPStatus, extra_headers: dict[str, str] | None = None) -> None:
+        headers = {"Connection": "close"}
+        if extra_headers:
+            headers.update(extra_headers)
+        self.close_connection = True
+        self.send_status_no_body(status, headers)
+
+    def send_dav_status_close(self, status: int | HTTPStatus, extra_headers: dict[str, str] | None = None) -> None:
+        headers = {"DAV": DAV_COMPLIANCE_HEADER, "MS-Author-Via": "DAV", "Connection": "close"}
+        if extra_headers:
+            headers.update(extra_headers)
+        self.close_connection = True
+        self.send_status_no_body(status, headers)
+
+    def send_xml(self, status: int | HTTPStatus, root: ET.Element, extra_headers: dict[str, str] | None = None) -> None:
+        body = dav_xml_response_body(root)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("DAV", DAV_COMPLIANCE_HEADER)
+        self.send_header("MS-Author-Via", "DAV")
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_dav_multistatus(self, root: ET.Element) -> None:
+        body = dav_multistatus_response_body(root)
+        self.send_response(HTTP_MULTI_STATUS)
+        self.send_header("Content-Type", "text/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("DAV", DAV_COMPLIANCE_HEADER)
+        self.send_header("MS-Author-Via", "DAV")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_dav_options(self) -> None:
+        allow = DAV_ALLOW_MISSING
+        try:
+            relative_path = self.parse_dav_path(urlparse(self.path).path)
+            target_path = resolve_relative_path(self.state.root, relative_path)
+            if target_path.is_dir():
+                allow = DAV_ALLOW_DIR
+            elif target_path.is_file():
+                allow = DAV_ALLOW_FILE
+        except ValueError:
+            allow = DAV_ALLOW_MISSING
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Allow", allow)
+        self.send_header("DAV", DAV_COMPLIANCE_HEADER)
+        self.send_header("MS-Author-Via", "DAV")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def parse_dav_path(self, url_path: str, *, allow_empty: bool = True) -> str:
+        return dav_relative_path_from_url_path(url_path, allow_empty=allow_empty)
+
+    def dav_base_url(self) -> str:
+        host = self.headers.get("Host", "")
+        if not host:
+            return ""
+        return f"http://{host}"
+
+    def dav_submitted_lock_tokens(self) -> set[str]:
+        tokens = dav_if_header_tokens(self.headers.get("If"))
+        lock_token = dav_lock_token_header_value(self.headers.get("Lock-Token"))
+        if lock_token:
+            tokens.add(lock_token)
+        return tokens
+
+    def ensure_dav_unlocked(self, relative_path: str, *, include_children: bool = False) -> bool:
+        submitted_tokens = self.dav_submitted_lock_tokens()
+        locked = (
+            self.state.dav_subtree_locked(relative_path, submitted_tokens)
+            if include_children
+            else self.state.dav_path_locked(relative_path, submitted_tokens)
+        )
+        if locked:
+            self.send_status_no_body(HTTP_LOCKED)
+            return False
+        return True
+
+    def send_dav_lock_response(self, status: int | HTTPStatus, lock_info: dict[str, Any]) -> None:
+        body = dav_lock_response_body(lock_info)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("DAV", DAV_COMPLIANCE_HEADER)
+        self.send_header("MS-Author-Via", "DAV")
+        self.send_header("Lock-Token", f"<{lock_info['token']}>")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def set_lockroot_href(self, relative_path: str, lock_info: dict[str, Any]) -> None:
+        lock_info["lockroot_href"] = dav_href(
+            relative_path,
+            is_directory=resolve_relative_path(self.state.root, relative_path).is_dir(),
+        )
+
+    def add_dav_live_properties(self, prop: ET.Element, path_value: str, absolute_path: Path, path_stat: os.stat_result) -> None:
+        for property_name in self.dav_default_property_names(absolute_path):
+            self.add_dav_property(prop, property_name, path_value, absolute_path, path_stat)
+
+    def dav_default_property_names(self, absolute_path: Path) -> list[str]:
+        names = [
+            dav_clark("resourcetype"),
+            dav_clark("displayname"),
+            dav_clark("supportedlock"),
+            dav_clark("getlastmodified"),
+            dav_clark("creationdate"),
+        ]
+        if not absolute_path.is_dir():
+            names.extend(
+                [
+                    dav_clark("getcontentlength"),
+                    dav_clark("getcontenttype"),
+                    dav_clark("getetag"),
+                ]
+            )
+        return names
+
+    def add_dav_property(
+        self,
+        prop: ET.Element,
+        property_name: str,
+        path_value: str,
+        absolute_path: Path,
+        path_stat: os.stat_result,
+    ) -> bool:
+        is_directory = absolute_path.is_dir()
+        if property_name == dav_clark("displayname"):
+            dav_add_text(prop, "displayname", "" if not path_value else absolute_path.name)
+        elif property_name == dav_clark("creationdate"):
+            dav_add_text(prop, "creationdate", dav_creation_date_for_user_agent(path_stat.st_ctime, self.headers.get("User-Agent", "")))
+        elif property_name == dav_clark("getlastmodified"):
+            dav_add_text(prop, "getlastmodified", dav_http_date(path_stat.st_mtime))
+        elif property_name == dav_clark("resourcetype"):
+            resourcetype = ET.SubElement(prop, dav_clark("resourcetype"))
+            if is_directory:
+                ET.SubElement(resourcetype, dav_clark("collection"))
+        elif property_name == dav_clark("getcontentlength"):
+            if is_directory:
+                return False
+            dav_add_text(prop, "getcontentlength", str(path_stat.st_size))
+        elif property_name == dav_clark("getcontenttype"):
+            if is_directory:
+                return False
+            dav_add_text(prop, "getcontenttype", mimetypes.guess_type(absolute_path.name)[0] or "application/octet-stream")
+        elif property_name == dav_clark("getetag"):
+            if is_directory:
+                return False
+            dav_add_text(prop, "getetag", dav_etag(path_stat))
+        elif property_name == dav_clark("supportedlock"):
+            dav_add_supportedlock(prop)
+        elif property_name == dav_clark("lockdiscovery"):
+            found_lock = self.state.find_dav_lock(path_value)
+            if found_lock is not None:
+                _, lock_info = found_lock
+                lock_info.setdefault("lockroot_href", dav_href(path_value, is_directory=is_directory))
+                prop.append(dav_make_lockdiscovery(lock_info))
+            else:
+                ET.SubElement(prop, dav_clark("lockdiscovery"))
+        elif property_name in {ms_dav_clark("iscollection"), ms_dav_clark("isFolder")}:
+            xml_add_text(prop, property_name, "t" if is_directory else "f")
+        elif property_name == ms_dav_clark("ishidden"):
+            xml_add_text(prop, property_name, "1" if absolute_path.name.startswith(".") else "0")
+        elif property_name in {ms_dav_clark("getcontenttype"), ms_office_clark("getcontenttype")}:
+            xml_add_text(prop, property_name, "application/x-directory" if is_directory else (mimetypes.guess_type(absolute_path.name)[0] or "application/octet-stream"))
+        elif property_name in {ms_dav_clark("Win32CreationTime"), ms_office_clark("Win32CreationTime")}:
+            xml_add_text(prop, property_name, dav_win32_file_time(path_stat.st_ctime))
+        elif property_name in {ms_dav_clark("Win32LastModifiedTime"), ms_office_clark("Win32LastModifiedTime")}:
+            xml_add_text(prop, property_name, dav_win32_file_time(path_stat.st_mtime))
+        elif property_name in {ms_dav_clark("Win32LastAccessTime"), ms_office_clark("Win32LastAccessTime")}:
+            xml_add_text(prop, property_name, dav_win32_file_time(path_stat.st_atime))
+        elif property_name == ms_repl_clark("repl-uid"):
+            xml_add_text(prop, property_name, f"rid:{hashlib.md5(dav_href(path_value).encode('utf-8')).hexdigest()}")
+        elif property_name == ms_repl_clark("resourcetag"):
+            xml_add_text(prop, property_name, f"rt:{path_stat.st_mtime_ns:x}-{path_stat.st_size:x}")
+        elif property_name == ms_repl_clark("modifiedby"):
+            xml_add_text(prop, property_name, "meFileServer")
+        elif property_name == ms_repl_clark("authoritative-directory"):
+            xml_add_text(prop, property_name, "t")
+        elif property_name == ms_repl_clark("timecreated"):
+            xml_add_text(prop, property_name, dav_time_t(path_stat.st_ctime))
+        elif property_name == ms_repl_clark("timelastmodified"):
+            xml_add_text(prop, property_name, dav_time_t(path_stat.st_mtime))
+        else:
+            return False
+        return True
+
+    def parse_dav_propfind_request(self, body: bytes) -> tuple[str, list[str]]:
+        if not body:
+            return "allprop", []
+        root = ET.fromstring(body)
+        if root.tag != dav_clark("propfind"):
+            raise ValueError("PROPFIND 请求体非法")
+        mode = ""
+        names: list[str] = []
+        for child in list(root):
+            if child.tag == dav_clark("allprop"):
+                if mode:
+                    raise ValueError("PROPFIND 模式冲突")
+                mode = "allprop"
+            elif child.tag == dav_clark("propname"):
+                if mode:
+                    raise ValueError("PROPFIND 模式冲突")
+                mode = "propname"
+            elif child.tag == dav_clark("prop"):
+                if mode and mode != "named":
+                    raise ValueError("PROPFIND 模式冲突")
+                mode = "named"
+                for prop_node in list(child):
+                    names.append(prop_node.tag)
+        return mode or "allprop", names
+
+    def handle_dav_propfind(self, url_path: str) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path)
+            body = b""
+            if self.get_content_length_or_zero() > 0:
+                body = self.read_request_body(max_bytes=256 * 1024)
+            propfind_mode, requested_properties = self.parse_dav_propfind_request(body)
+        except (ValueError, ET.ParseError):
+            self.send_status_no_body(HTTPStatus.BAD_REQUEST)
+            return
+
+        target_path = resolve_relative_path(self.state.root, relative_path)
+        if not target_path.exists():
+            self.send_dav_status_no_body(HTTPStatus.NOT_FOUND)
+            return
+
+        depth = self.headers.get("Depth", "infinity").strip().lower()
+        if depth not in {"0", "1", "infinity"}:
+            depth = "infinity"
+
+        multistatus = ET.Element(dav_clark("multistatus"))
+        base_url = ""
+
+        def add_response(path_value: str, absolute_path: Path) -> None:
+            try:
+                path_stat = absolute_path.stat()
+                is_directory = absolute_path.is_dir()
+            except OSError:
+                return
+
+            response = ET.SubElement(multistatus, dav_clark("response"))
+            dav_add_text(response, "href", dav_href(path_value, is_directory=is_directory, base_url=base_url))
+            propstat = ET.SubElement(response, dav_clark("propstat"))
+            prop = ET.SubElement(propstat, dav_clark("prop"))
+            if propfind_mode == "propname":
+                for property_name in sorted(
+                    dav_live_property_tag_set(),
+                    key=lambda tag: dav_clark_to_prefixed_name(tag),
+                ):
+                    if not dav_property_applies_to_path(property_name, absolute_path):
+                        continue
+                    ET.SubElement(prop, property_name)
+                dav_add_text(propstat, "status", dav_status_text(200))
+                return
+            missing_properties: list[str] = []
+            property_names = self.dav_default_property_names(absolute_path) if propfind_mode == "allprop" else requested_properties
+            for property_name in property_names:
+                if not self.add_dav_property(prop, property_name, path_value, absolute_path, path_stat):
+                    missing_properties.append(property_name)
+            dav_add_text(propstat, "status", dav_status_text(200))
+            if missing_properties:
+                missing_propstat = ET.SubElement(response, dav_clark("propstat"))
+                missing_prop = ET.SubElement(missing_propstat, dav_clark("prop"))
+                for property_name in missing_properties:
+                    ET.SubElement(missing_prop, property_name)
+                dav_add_text(missing_propstat, "status", dav_status_text(404))
+
+        def walk(path_value: str, absolute_path: Path) -> None:
+            add_response(path_value, absolute_path)
+            if not absolute_path.is_dir() or depth == "0":
+                return
+            try:
+                entries = list_visible_entries(absolute_path)
+            except OSError:
+                return
+            for entry in entries:
+                entry_path = f"{path_value}/{entry.name}" if path_value else entry.name
+                if depth == "infinity" and entry.is_dir():
+                    walk(entry_path, entry)
+                else:
+                    add_response(entry_path, entry)
+
+        walk(relative_path, target_path)
+        self.send_dav_multistatus(multistatus)
+
+    def handle_dav_proppatch(self, url_path: str) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path)
+        except ValueError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+
+        if not self.ensure_dav_unlocked(relative_path):
+            return
+
+        target_path = resolve_relative_path(self.state.root, relative_path)
+        if not target_path.exists():
+            self.send_dav_status_no_body(HTTPStatus.NOT_FOUND)
+            return
+
+        try:
+            body = self.read_request_body(max_bytes=256 * 1024)
+        except ValueError:
+            self.send_dav_status_no_body(HTTPStatus.BAD_REQUEST)
+            return
+
+        property_names: list[str] = []
+        if body:
+            try:
+                root = ET.fromstring(body)
+            except ET.ParseError:
+                self.send_dav_status_no_body(HTTPStatus.BAD_REQUEST)
+                return
+            for prop_node in root.findall(f".//{dav_clark('prop')}"):
+                for child in list(prop_node):
+                    property_names.append(child.tag)
+
+        multistatus = ET.Element(dav_clark("multistatus"))
+        response = ET.SubElement(multistatus, dav_clark("response"))
+        dav_add_text(response, "href", dav_href(relative_path, is_directory=target_path.is_dir()))
+        propstat = ET.SubElement(response, dav_clark("propstat"))
+        prop = ET.SubElement(propstat, dav_clark("prop"))
+        for property_name in property_names:
+            ET.SubElement(prop, property_name)
+        dav_add_text(propstat, "status", dav_status_text(200))
+        self.send_dav_multistatus(multistatus)
+
+    def build_dav_missing_multistatus(self, relative_path: str) -> ET.Element:
+        multistatus = ET.Element(dav_clark("multistatus"))
+        response = ET.SubElement(multistatus, dav_clark("response"))
+        dav_add_text(response, "href", dav_href(relative_path, base_url=self.dav_base_url()))
+        dav_add_text(response, "status", dav_status_text(404))
+        return multistatus
+
+    def handle_dav_get(self, url_path: str, *, head_only: bool = False) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path, allow_empty=False)
+        except ValueError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+
+        file_path = resolve_relative_path(self.state.root, relative_path)
+        if file_path.is_dir():
+            self.send_status_no_body(HTTPStatus.METHOD_NOT_ALLOWED, {"Allow": DAV_ALLOW_HEADER})
+            return
+        if not file_path.is_file():
+            self.send_status_no_body(HTTPStatus.NOT_FOUND)
+            return
+
+        file_stat = file_path.stat()
+        file_size = file_stat.st_size
+        start = 0
+        end = file_size - 1
+        status = HTTPStatus.OK
+        range_header = self.headers.get("Range")
+
+        if range_header:
+            byte_range = parse_single_range(range_header, file_size)
+            if byte_range is None:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            start, end = byte_range
+            status = HTTPStatus.PARTIAL_CONTENT
+
+        content_length = max(0, end - start + 1)
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+
+        self.send_response(status)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Last-Modified", dav_http_date(file_stat.st_mtime))
+        self.send_header("Etag", dav_etag(file_stat))
+        self.send_header("MS-Author-Via", "DAV")
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.end_headers()
+
+        if head_only or content_length == 0:
+            return
+
+        try:
+            with file_path.open("rb") as handle:
+                handle.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk = handle.read(min(DOWNLOAD_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as exc:
+            if self.is_client_disconnect_error(exc):
+                self.close_connection = True
+                return
+            raise
+
+    def handle_dav_put(self, url_path: str) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path, allow_empty=False)
+            content_length = self.get_content_length()
+        except ValueError:
+            self.send_dav_status_close(HTTPStatus.BAD_REQUEST)
+            return
+
+        if not self.ensure_dav_unlocked(relative_path):
+            self.close_connection = True
+            return
+
+        target_path = resolve_relative_path(self.state.root, relative_path)
+        if target_path.exists() and target_path.is_dir():
+            self.send_dav_status_close(HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+        if not target_path.parent.is_dir():
+            self.send_dav_status_close(HTTPStatus.CONFLICT)
+            return
+
+        file_lock = self.state.get_file_lock(relative_path)
+        temp_path = target_path.with_name(f".{target_path.name}.dav-{uuid.uuid4().hex}.tmp")
+        try:
+            with file_lock:
+                remaining = content_length
+                with temp_path.open("wb") as handle:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(DAV_WRITE_CHUNK, remaining))
+                        if not chunk:
+                            raise ConnectionError("客户端在写入过程中断开连接")
+                        handle.write(chunk)
+                        remaining -= len(chunk)
+                os.replace(temp_path, target_path)
+                remove_sidecar(target_path)
+        except ConnectionError:
+            self.close_connection = True
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        except OSError:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            self.send_dav_status_close(HTTP_INSUFFICIENT_STORAGE)
+            return
+
+        extra_headers = {"Location": dav_href(relative_path, base_url=self.dav_base_url())}
+        try:
+            extra_headers["Etag"] = dav_etag(target_path.stat())
+        except OSError:
+            pass
+        self.send_dav_status_no_body(HTTPStatus.CREATED, extra_headers)
+
+    def handle_dav_mkcol(self, url_path: str) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path, allow_empty=False)
+        except ValueError:
+            self.send_dav_status_no_body(HTTPStatus.BAD_REQUEST)
+            return
+
+        if not self.ensure_dav_unlocked(relative_path):
+            return
+
+        if self.get_content_length_or_zero() > 0:
+            self.send_dav_status_close(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+
+        target_path = resolve_relative_path(self.state.root, relative_path)
+        if target_path.exists():
+            self.send_dav_status_no_body(HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+        if not target_path.parent.is_dir():
+            self.send_dav_status_no_body(HTTPStatus.CONFLICT)
+            return
+
+        try:
+            target_path.mkdir()
+        except OSError:
+            self.send_dav_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+        self.send_dav_status_no_body(HTTPStatus.CREATED, {"Location": dav_href(relative_path, is_directory=True, base_url=self.dav_base_url())})
+
+    def handle_dav_delete(self, url_path: str) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path, allow_empty=False)
+        except ValueError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+
+        if not self.ensure_dav_unlocked(relative_path, include_children=True):
+            return
+
+        target_path = resolve_relative_path(self.state.root, relative_path)
+        if not target_path.exists():
+            self.send_status_no_body(HTTPStatus.NOT_FOUND)
+            return
+
+        try:
+            if target_path.is_dir():
+                delete_directory_tree(target_path)
+            else:
+                with self.state.get_file_lock(relative_path):
+                    delete_file_path(target_path)
+        except OSError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+        self.send_status_no_body(HTTPStatus.NO_CONTENT)
+
+    def parse_dav_destination(self) -> str | None:
+        header_value = self.headers.get("Destination")
+        if not header_value:
+            return None
+        parsed_destination = urlparse(header_value)
+        if parsed_destination.netloc:
+            request_host = self.headers.get("Host", "").split("@")[-1].lower()
+            if parsed_destination.netloc.lower() != request_host:
+                return None
+        destination_path = parsed_destination.path or header_value
+        if not is_dav_request_path(destination_path):
+            return None
+        try:
+            return self.parse_dav_path(destination_path, allow_empty=False)
+        except ValueError:
+            return None
+
+    def dav_prepare_copy_move(self, src_url_path: str) -> tuple[str, Path, str, Path] | None:
+        try:
+            src_relative = self.parse_dav_path(src_url_path, allow_empty=False)
+        except ValueError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return None
+        dst_relative = self.parse_dav_destination()
+        if dst_relative is None:
+            self.send_status_no_body(HTTPStatus.BAD_REQUEST)
+            return None
+
+        src_path = resolve_relative_path(self.state.root, src_relative)
+        dst_path = resolve_relative_path(self.state.root, dst_relative)
+        if not src_path.exists():
+            self.send_status_no_body(HTTPStatus.NOT_FOUND)
+            return None
+        if src_path.is_dir() and dav_is_same_or_child_path(dst_relative, src_relative):
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return None
+        if src_relative == dst_relative:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return None
+        if not dst_path.parent.is_dir():
+            self.send_status_no_body(HTTPStatus.CONFLICT)
+            return None
+        submitted_tokens = self.dav_submitted_lock_tokens()
+        if self.state.dav_subtree_locked(src_relative, submitted_tokens) or self.state.dav_path_locked(dst_relative, submitted_tokens):
+            self.send_status_no_body(HTTP_LOCKED)
+            return None
+        return src_relative, src_path, dst_relative, dst_path
+
+    def handle_dav_copy(self, url_path: str) -> None:
+        prepared = self.dav_prepare_copy_move(url_path)
+        if prepared is None:
+            return
+        _, src_path, dst_relative, dst_path = prepared
+        overwrite = self.headers.get("Overwrite", "T").strip().upper() != "F"
+        existed = dst_path.exists()
+        if existed and not overwrite:
+            self.send_status_no_body(HTTPStatus.PRECONDITION_FAILED)
+            return
+
+        try:
+            if existed:
+                if dst_path.is_dir():
+                    delete_directory_tree(dst_path)
+                else:
+                    delete_file_path(dst_path)
+            if src_path.is_dir():
+                dav_copy_directory(src_path, dst_path)
+            else:
+                shutil.copy2(src_path, dst_path)
+                remove_sidecar(dst_path)
+        except OSError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+        self.send_status_no_body(HTTPStatus.NO_CONTENT if existed else HTTPStatus.CREATED)
+
+    def handle_dav_move(self, url_path: str) -> None:
+        prepared = self.dav_prepare_copy_move(url_path)
+        if prepared is None:
+            return
+        src_relative, src_path, dst_relative, dst_path = prepared
+        overwrite = self.headers.get("Overwrite", "T").strip().upper() != "F"
+        existed = dst_path.exists()
+        if existed and not overwrite:
+            self.send_status_no_body(HTTPStatus.PRECONDITION_FAILED)
+            return
+
+        try:
+            if existed:
+                if dst_path.is_dir():
+                    delete_directory_tree(dst_path)
+                else:
+                    delete_file_path(dst_path)
+            locks = [self.state.get_file_lock(src_relative)]
+            if dst_relative != src_relative:
+                locks.append(self.state.get_file_lock(dst_relative))
+            for lock in locks:
+                lock.acquire()
+            try:
+                shutil.move(str(src_path), str(dst_path))
+                remove_sidecar(dst_path)
+            finally:
+                for lock in reversed(locks):
+                    lock.release()
+        except OSError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+        self.send_status_no_body(HTTPStatus.NO_CONTENT if existed else HTTPStatus.CREATED)
+
+    def handle_dav_lock(self, url_path: str) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path)
+        except ValueError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+
+        submitted_tokens = self.dav_submitted_lock_tokens()
+        found_lock = self.state.find_dav_lock(relative_path)
+        if found_lock is not None:
+            _, lock_info = found_lock
+            if str(lock_info.get("token", "")) not in submitted_tokens:
+                self.send_status_no_body(HTTP_LOCKED)
+                return
+            lock_info["expires_at"] = time.time() + dav_parse_timeout(self.headers.get("Timeout"))
+            self.set_lockroot_href(relative_path, lock_info)
+            self.send_dav_lock_response(HTTPStatus.OK, lock_info)
+            return
+
+        try:
+            body = self.read_request_body(max_bytes=64 * 1024) if self.get_content_length_or_zero() > 0 else b""
+        except ValueError:
+            self.send_status_close(HTTPStatus.BAD_REQUEST)
+            return
+        owner = dav_extract_owner(body)
+        depth = self.headers.get("Depth", "infinity").strip().lower()
+        if depth not in {"0", "infinity"}:
+            depth = "infinity"
+        target_path = resolve_relative_path(self.state.root, relative_path)
+        if not target_path.exists():
+            if not relative_path or not target_path.parent.is_dir():
+                self.send_dav_status_no_body(HTTPStatus.CONFLICT)
+                return
+        if target_path.exists() and target_path.is_dir() and depth == "infinity":
+            submitted_tokens = self.dav_submitted_lock_tokens()
+            if self.state.dav_subtree_locked(relative_path, submitted_tokens):
+                self.send_status_no_body(HTTP_LOCKED)
+                return
+        lock_info = self.state.create_dav_lock(
+            relative_path,
+            owner=owner,
+            timeout_seconds=dav_parse_timeout(self.headers.get("Timeout")),
+            depth=depth,
+        )
+        self.set_lockroot_href(relative_path, lock_info)
+        self.send_dav_lock_response(HTTPStatus.OK, lock_info)
+
+    def handle_dav_unlock(self, url_path: str) -> None:
+        try:
+            relative_path = self.parse_dav_path(url_path)
+        except ValueError:
+            self.send_status_no_body(HTTPStatus.FORBIDDEN)
+            return
+
+        token = dav_lock_token_header_value(self.headers.get("Lock-Token"))
+        if not token:
+            self.send_status_no_body(HTTPStatus.BAD_REQUEST)
+            return
+        if not self.state.remove_dav_lock(relative_path, token):
+            self.send_status_no_body(HTTPStatus.CONFLICT)
+            return
+        self.send_status_no_body(HTTPStatus.NO_CONTENT)
+
     def read_request_body(self, max_bytes: int | None = None) -> bytes:
         length = self.get_content_length()
         if max_bytes is not None and length > max_bytes:
@@ -2609,6 +3984,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         if raw_length is None:
             raise ValueError("缺少 Content-Length")
         length = int(raw_length)
+        if length < 0:
+            raise ValueError("Content-Length 非法")
+        return length
+
+    def get_content_length_or_zero(self) -> int:
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            return 0
+        try:
+            length = int(raw_length)
+        except ValueError:
+            raise ValueError("Content-Length 非法")
         if length < 0:
             raise ValueError("Content-Length 非法")
         return length
@@ -2962,7 +4349,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         self.send_json(HTTPStatus.OK, response)
 
-    def handle_download(self, query: str) -> None:
+    def handle_download(self, query: str, *, head_only: bool = False) -> None:
         try:
             relative_path = self.parse_query_path(query)
         except ValueError:
@@ -3006,25 +4393,36 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Disposition", content_disposition)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.end_headers()
+        self.close_connection = True
 
-        with file_path.open("rb") as handle:
-            if content_length == 0:
+        if head_only:
+            return
+
+        try:
+            with file_path.open("rb") as handle:
+                if content_length == 0:
+                    return
+                handle.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk = handle.read(min(DOWNLOAD_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as exc:
+            if self.is_client_disconnect_error(exc):
+                self.close_connection = True
                 return
-            handle.seek(start)
-            remaining = content_length
-            while remaining > 0:
-                chunk = handle.read(min(DOWNLOAD_CHUNK, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
+            raise
 
 
 def render_home_page(root: Path) -> str:
-    return HOME_PAGE.replace("__ROOT__", html.escape(str(root)))
+    return HOME_PAGE.replace("__ROOT__", html.escape(str(root))).replace("__WEBDAV__", DAV_ROOT_PATH)
 
 
 def render_login_page(message: str) -> str:
@@ -3209,6 +4607,9 @@ def main() -> int:
     print("可访问地址：")
     for url in access_urls:
         print(f"  {url}")
+    print("WebDAV 地址：")
+    for url in access_urls:
+        print(f"  {url}{DAV_ROOT_PATH}")
     try:
         serve_servers(servers)
     except KeyboardInterrupt:
