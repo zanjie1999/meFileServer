@@ -2,6 +2,7 @@
 
 # 咩FileServer
 # zyyme 20260419
+# v4.0
 
 import argparse
 import base64
@@ -35,7 +36,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
-VER = "v3.0"
+VER = "v4.0"
 SIDECAR_SUFFIX = ".mefs"
 UPLOAD_READ_CHUNK = 64 * 1024
 PROGRESS_FLUSH_BYTES = 1024 * 1024
@@ -397,6 +398,78 @@ HOME_PAGE = """<!doctype html>
       margin-top: 12px;
       color: var(--muted);
     }
+    .check-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.94rem;
+      font-weight: 600;
+      color: var(--ink);
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+    .check-label input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .check-label input[type="checkbox"]:disabled {
+      cursor: not-allowed;
+    }
+    .drop-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 60;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 18px 16px;
+      pointer-events: none;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 120ms ease, visibility 120ms ease;
+    }
+    .drop-overlay.visible {
+      opacity: 1;
+      visibility: visible;
+    }
+    .drop-overlay-card {
+      max-width: min(92vw, 900px);
+      min-width: min(64vw, 420px);
+      padding: 16px 28px;
+      border-radius: 22px;
+      border: 3px dashed var(--accent);
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 16px 40px rgba(18, 50, 74, 0.22);
+      text-align: center;
+    }
+    .drop-overlay.invalid .drop-overlay-card {
+      border-color: var(--danger);
+    }
+    .drop-overlay-hint {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    .drop-overlay-path {
+      margin-top: 10px;
+      font-size: clamp(2rem, 5.2vw, 3.4rem);
+      font-weight: 800;
+      line-height: 1.25;
+      color: var(--accent);
+      word-break: break-all;
+    }
+    .drop-overlay.invalid .drop-overlay-path {
+      color: var(--danger);
+    }
+    .entry-row.drop-target {
+      background: #fff6c9;
+      border-color: #d9c85a;
+    }
     @media (max-width: 640px) {
       main {
         padding: 18px 12px 28px;
@@ -421,19 +494,27 @@ HOME_PAGE = """<!doctype html>
       <p>哔哩哔哩：<a href="https://space.bilibili.com/9992930" target="_blank">郑羊羊</a> | 项目开源：<a href="https://github.com/zanjie1999/meFileServer" target="_blank">GitHub</a></p>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="upload-panel">
       <h2>上传</h2>
-      <p>已存在目录会自动合并，已存在文件会跳过</p>
+      <p>已有目录会自动合并，已有文件默认跳过</p>
       <div class="row">
         <input id="single-file-input" type="file" multiple hidden>
         <input id="folder-file-input" type="file" multiple webkitdirectory hidden>
         <button id="upload-file-btn" type="button">上传文件</button>
         <button id="upload-folder-btn" type="button" class="secondary">上传文件夹</button>
+        <label class="check-label" for="overwrite-existing-check">
+          <input id="overwrite-existing-check" type="checkbox">
+          覆盖已有文件
+        </label>
       </div>
       <div class="row upload-target-box">
         <span class="upload-target-label">当前上传到：</span>
         <code id="upload-target-path">/</code>
         <button id="reset-upload-target-btn" type="button" class="light">切回根目录</button>
+        <label class="check-label" for="follow-browse-check">
+          <input id="follow-browse-check" type="checkbox" checked>
+          跟随浏览目录
+        </label>
       </div>
       <div class="hint">文件夹上传和下载依赖Chromium的目录访问API和https</div>
       <div id="status" class="status">等待上传</div>
@@ -455,7 +536,7 @@ HOME_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="download-panel">
       <h2>下载</h2>
       <div class="browser-toolbar">
         <button id="browse-up-btn" type="button" class="light">返回上级</button>
@@ -473,6 +554,13 @@ HOME_PAGE = """<!doctype html>
     </section>
   </main>
 
+  <div id="drop-overlay" class="drop-overlay">
+    <div class="drop-overlay-card">
+      <div id="drop-overlay-hint" class="drop-overlay-hint">松手上传到</div>
+      <div id="drop-overlay-path" class="drop-overlay-path">/</div>
+    </div>
+  </div>
+
   <script>
     const chunkSize = 8 * 1024 * 1024;
     const retryDelaySeconds = 10;
@@ -487,6 +575,13 @@ HOME_PAGE = """<!doctype html>
     const uploadFolderButton = document.getElementById("upload-folder-btn");
     const resetUploadTargetButton = document.getElementById("reset-upload-target-btn");
     const uploadTargetPathNode = document.getElementById("upload-target-path");
+    const followBrowseCheckNode = document.getElementById("follow-browse-check");
+    const overwriteExistingCheckNode = document.getElementById("overwrite-existing-check");
+    const uploadPanelNode = document.getElementById("upload-panel");
+    const downloadPanelNode = document.getElementById("download-panel");
+    const dropOverlayNode = document.getElementById("drop-overlay");
+    const dropOverlayHintNode = document.getElementById("drop-overlay-hint");
+    const dropOverlayPathNode = document.getElementById("drop-overlay-path");
     const statusNode = document.getElementById("status");
     const currentProgressNode = document.getElementById("current-progress");
     const currentProgressTextNode = document.getElementById("current-progress-text");
@@ -508,6 +603,10 @@ HOME_PAGE = """<!doctype html>
     let currentBrowseDirectory = null;
     let rootDirectoryName = "根目录";
     let uploadInProgress = false;
+    let followBrowsePath = true;
+    let overwriteExisting = false;
+    let dragDepth = 0;
+    let dragHoverRow = null;
     const directoryCache = new Map();
     let uploadMetrics = createEmptyUploadMetrics();
 
@@ -707,6 +806,13 @@ HOME_PAGE = """<!doctype html>
       }
     }
 
+    async function resetUploadTargetToRoot() {
+      if (followBrowsePath) {
+        await browseTo("", { silent: true });
+      }
+      setUploadTarget("");
+    }
+
     function updateProgressBar(node, value, total) {
       if (total > 0) {
         node.max = total;
@@ -820,6 +926,8 @@ HOME_PAGE = """<!doctype html>
       folderFileInput.disabled = nextBusy;
       uploadFileButton.disabled = nextBusy;
       uploadFolderButton.disabled = nextBusy;
+      followBrowseCheckNode.disabled = nextBusy;
+      overwriteExistingCheckNode.disabled = nextBusy;
       updateUploadTargetView();
       updateBrowseControls();
       if (currentBrowseDirectory) {
@@ -1131,6 +1239,7 @@ HOME_PAGE = """<!doctype html>
           setStatus(error.message || String(error), true);
         });
       });
+      row.setAttribute("data-drop-path", entry.path);
 
       const main = document.createElement("div");
       main.className = "entry-main";
@@ -1165,6 +1274,10 @@ HOME_PAGE = """<!doctype html>
     function renderDirectoryView(directory) {
       currentBrowseDirectory = directory;
       currentBrowsePath = directory.path || "";
+      if (followBrowsePath && currentUploadPath !== currentBrowsePath) {
+        currentUploadPath = currentBrowsePath;
+        updateUploadTargetView();
+      }
       renderBreadcrumb(directory);
       updateBrowseControls();
 
@@ -1235,6 +1348,7 @@ HOME_PAGE = """<!doctype html>
         xhr.setRequestHeader("X-Start-Offset", String(start));
         xhr.setRequestHeader("X-File-Size", String(task.file.size));
         xhr.setRequestHeader("X-File-Mtime", String(task.file.lastModified));
+        xhr.setRequestHeader("X-Overwrite", task.overwrite === true ? "1" : "0");
 
         xhr.upload.addEventListener("progress", (event) => {
           markActivity();
@@ -1302,6 +1416,7 @@ HOME_PAGE = """<!doctype html>
           path: task.path,
           size: task.file.size,
           mtime_ms: task.file.lastModified,
+          overwrite: task.overwrite === true,
         }),
       }, `探测 ${task.path}`);
     }
@@ -1349,18 +1464,21 @@ HOME_PAGE = """<!doctype html>
       return lines.join("\\n");
     }
 
-    function confirmUploadTasks(tasks, taskLabel, { directoryPaths = [] } = {}) {
+    function confirmUploadTasks(tasks, taskLabel, { directoryPaths = [], targetPath = null } = {}) {
       if (!tasks.length && !directoryPaths.length) {
         return true;
       }
+      const resolvedTarget = targetPath !== null
+        ? targetPath
+        : (tasks.length ? (tasks[0].targetPath || "") : "");
       const confirmed = window.confirm(buildUploadConfirmMessage({
         taskLabel,
-        targetPath: currentUploadPath,
+        targetPath: resolvedTarget,
         tasks,
         directoryPaths,
       }));
       if (!confirmed) {
-        setStatus(`已取消上传到：${getDisplayPath(currentUploadPath)}`);
+        setStatus(`已取消上传到：${getDisplayPath(resolvedTarget)}`);
       }
       return confirmed;
     }
@@ -1376,6 +1494,10 @@ HOME_PAGE = """<!doctype html>
       setBusyState(true);
       uploadInProgress = true;
       startUploadMetrics();
+      const overwrite = overwriteExisting;
+      for (const task of tasks) {
+        task.overwrite = overwrite;
+      }
       const totalFiles = tasks.length;
       const totalBytes = tasks.reduce((sum, item) => sum + item.file.size, 0);
       let completedFiles = 0;
@@ -1545,7 +1667,8 @@ HOME_PAGE = """<!doctype html>
         setStatus("已取消选择文件");
         return;
       }
-      const tasks = files.map((file) => ({ path: joinUploadPath(currentUploadPath, file.name), file }));
+      const targetPath = currentUploadPath;
+      const tasks = files.map((file) => ({ path: joinUploadPath(targetPath, file.name), file, targetPath }));
       if (!confirmUploadTasks(tasks, "文件上传")) {
         return;
       }
@@ -1556,7 +1679,7 @@ HOME_PAGE = """<!doctype html>
       }
     }
 
-    function collectDirectoryTasksFromInputFiles(files) {
+    function collectDirectoryTasksFromInputFiles(files, basePath) {
       const directories = new Set();
       const tasks = [];
       let rootPath = "";
@@ -1586,8 +1709,9 @@ HOME_PAGE = """<!doctype html>
         }
 
         tasks.push({
-          path: joinUploadPath(currentUploadPath, [...pathParts, fileName].join("/")),
+          path: joinUploadPath(basePath, [...pathParts, fileName].join("/")),
           file,
+          targetPath: basePath,
         });
       }
 
@@ -1610,17 +1734,18 @@ HOME_PAGE = """<!doctype html>
         return;
       }
 
-      const collected = collectDirectoryTasksFromInputFiles(files);
+      const collected = collectDirectoryTasksFromInputFiles(files, currentUploadPath);
       if (!collected.files.length) {
         setStatus("未选择可上传的文件。兼容模式下不会保留纯空文件夹。");
         return;
       }
 
+      const targetPath = currentUploadPath;
       try {
-        if (!confirmUploadTasks(collected.files, `文件夹 ${collected.rootPath} 上传`)) {
+        if (!confirmUploadTasks(collected.files, `文件夹 ${collected.rootPath} 上传`, { targetPath })) {
           return;
         }
-        const directories = collected.directories.map((path) => joinUploadPath(currentUploadPath, path));
+        const directories = collected.directories.map((path) => joinUploadPath(targetPath, path));
         await ensureRemoteDirectories(directories);
         await runUploadTasks(collected.files, `文件夹 ${collected.rootPath} 上传`);
       } catch (_) {
@@ -1745,12 +1870,14 @@ HOME_PAGE = """<!doctype html>
         const handle = await window.showDirectoryPicker({ mode: "read" });
         setStatus(`正在读取文件夹：${handle.name}`);
         const collected = await collectDirectoryTasks(handle);
-        const directories = collected.directories.map((path) => joinUploadPath(currentUploadPath, path));
+        const targetPath = currentUploadPath;
+        const directories = collected.directories.map((path) => joinUploadPath(targetPath, path));
         const files = collected.files.map((item) => ({
-          path: joinUploadPath(currentUploadPath, item.path),
+          path: joinUploadPath(targetPath, item.path),
           file: item.file,
+          targetPath,
         }));
-        if (!confirmUploadTasks(files, `文件夹 ${collected.rootPath} 上传`, { directoryPaths: directories })) {
+        if (!confirmUploadTasks(files, `文件夹 ${collected.rootPath} 上传`, { directoryPaths: directories, targetPath })) {
           return;
         }
         await ensureRemoteDirectories(directories);
@@ -1946,11 +2073,26 @@ HOME_PAGE = """<!doctype html>
     singleFileInput.addEventListener("change", handleSingleFileSelection);
     folderFileInput.addEventListener("change", handleFolderFileSelection);
     uploadFolderButton.addEventListener("click", uploadFolder);
+    followBrowseCheckNode.addEventListener("change", () => {
+      followBrowsePath = followBrowseCheckNode.checked;
+      if (!followBrowsePath || busy) {
+        return;
+      }
+      setUploadTarget(currentBrowsePath);
+    });
+    overwriteExistingCheckNode.addEventListener("change", () => {
+      overwriteExisting = overwriteExistingCheckNode.checked;
+      setStatus(overwriteExisting
+        ? "已开启覆盖：同名文件将重新上传"
+        : "已关闭覆盖：同名完整文件将被跳过");
+    });
     resetUploadTargetButton.addEventListener("click", () => {
       if (busy || !currentUploadPath) {
         return;
       }
-      setUploadTarget("");
+      resetUploadTargetToRoot().catch((error) => {
+        setStatus(error.message || String(error), true);
+      });
     });
     browseUpButton.addEventListener("click", () => {
       if (busy || !currentBrowsePath) {
@@ -1996,8 +2138,272 @@ HOME_PAGE = """<!doctype html>
       event.returnValue = "";
     });
 
+    function closestFromEvent(event, selector) {
+      const node = event.target;
+      if (!node || typeof node.closest !== "function") {
+        return null;
+      }
+      return node.closest(selector);
+    }
+
+    function isFileDragEvent(event) {
+      const transfer = event.dataTransfer;
+      if (!transfer || !transfer.types) {
+        return false;
+      }
+      for (let index = 0; index < transfer.types.length; index += 1) {
+        if (transfer.types[index] === "Files") {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function resolveDropTarget(event) {
+      const row = closestFromEvent(event, ".entry-row[data-drop-path]");
+      if (row && downloadPanelNode.contains(row)) {
+        return { kind: "directory", path: row.getAttribute("data-drop-path") || "", row };
+      }
+      const panel = closestFromEvent(event, ".panel");
+      if (panel === uploadPanelNode) {
+        return { kind: "upload", path: currentUploadPath, row: null };
+      }
+      if (panel === downloadPanelNode) {
+        return { kind: "browse", path: currentBrowsePath, row: null };
+      }
+      return null;
+    }
+
+    function clearDragHighlight() {
+      dragDepth = 0;
+      if (dragHoverRow) {
+        dragHoverRow.classList.remove("drop-target");
+        dragHoverRow = null;
+      }
+      dropOverlayNode.classList.remove("visible");
+      dropOverlayNode.classList.remove("invalid");
+    }
+
+    function updateDragHighlight(target) {
+      const nextRow = target && target.row ? target.row : null;
+      if (dragHoverRow && dragHoverRow !== nextRow) {
+        dragHoverRow.classList.remove("drop-target");
+      }
+      dragHoverRow = nextRow;
+      if (dragHoverRow) {
+        dragHoverRow.classList.add("drop-target");
+      }
+
+      dropOverlayNode.classList.add("visible");
+      if (busy) {
+        dropOverlayNode.classList.add("invalid");
+        dropOverlayHintNode.textContent = "正在上传，请完成后再拖拽";
+        dropOverlayPathNode.textContent = "";
+        return;
+      }
+      if (!target) {
+        dropOverlayNode.classList.add("invalid");
+        dropOverlayHintNode.textContent = "不能上传到这里，请拖到上传或下载区域";
+        dropOverlayPathNode.textContent = "";
+        return;
+      }
+      dropOverlayNode.classList.remove("invalid");
+      if (target.kind === "directory") {
+        dropOverlayHintNode.textContent = "松手上传到该目录";
+      } else if (target.kind === "upload") {
+        dropOverlayHintNode.textContent = "松手上传到当前上传目录";
+      } else {
+        dropOverlayHintNode.textContent = "松手上传到当前浏览目录";
+      }
+      dropOverlayPathNode.textContent = getDisplayPath(target.path);
+    }
+
+    function collectDropTransfer(event) {
+      const transfer = event.dataTransfer;
+      if (!transfer) {
+        return { entries: [], files: [] };
+      }
+      const entries = [];
+      const items = transfer.items ? Array.from(transfer.items) : [];
+      for (const item of items) {
+        if (item.kind !== "file") {
+          continue;
+        }
+        if (typeof item.webkitGetAsEntry === "function") {
+          const entry = item.webkitGetAsEntry();
+          if (entry) {
+            entries.push(entry);
+            continue;
+          }
+        }
+        const file = typeof item.getAsFile === "function" ? item.getAsFile() : null;
+        if (file) {
+          entries.push({ isFile: true, isDirectory: false, name: file.name, directFile: file });
+        }
+      }
+      const files = transfer.files ? Array.from(transfer.files) : [];
+      return { entries, files };
+    }
+
+    function readFileFromEntry(entry) {
+      return new Promise((resolve, reject) => {
+        entry.file(resolve, reject);
+      });
+    }
+
+    function readDirectoryEntries(directoryEntry) {
+      return new Promise((resolve, reject) => {
+        const reader = directoryEntry.createReader();
+        const collected = [];
+        const readBatch = () => {
+          reader.readEntries((batch) => {
+            if (!batch.length) {
+              resolve(collected);
+              return;
+            }
+            collected.push(...batch);
+            readBatch();
+          }, reject);
+        };
+        readBatch();
+      });
+    }
+
+    async function collectDropEntry(entry, parentPath, collected) {
+      const name = entry.name || "";
+      if (!name) {
+        return;
+      }
+      const currentPath = parentPath ? `${parentPath}/${name}` : name;
+      if (entry.isFile) {
+        const file = entry.directFile || await readFileFromEntry(entry);
+        if (file) {
+          collected.files.push({ path: currentPath, file });
+        }
+        return;
+      }
+      if (entry.isDirectory) {
+        collected.directories.push(currentPath);
+        const children = await readDirectoryEntries(entry);
+        for (const child of children) {
+          await collectDropEntry(child, currentPath, collected);
+        }
+      }
+    }
+
+    async function buildDropPlan(dropped) {
+      const collected = { directories: [], files: [] };
+      let usedEntries = false;
+      for (const entry of dropped.entries) {
+        if (!entry || (!entry.isFile && !entry.isDirectory)) {
+          continue;
+        }
+        usedEntries = true;
+        await collectDropEntry(entry, "", collected);
+      }
+      if (!usedEntries) {
+        for (const file of dropped.files) {
+          if (file && file.name) {
+            collected.files.push({ path: file.name, file });
+          }
+        }
+      }
+      return collected;
+    }
+
+    async function handleDropUpload(target, dropped) {
+      if (busy) {
+        return;
+      }
+      if (target.kind === "browse" && !currentBrowseDirectory) {
+        setStatus("当前浏览目录不可用，请先在下方打开一个目录", true);
+        return;
+      }
+
+      const basePath = target.path || "";
+      setStatus(`正在读取拖入的内容，目标：${getDisplayPath(basePath)}`);
+      const collected = await buildDropPlan(dropped);
+      const directories = collected.directories.map((path) => joinUploadPath(basePath, path));
+      const tasks = collected.files
+        .map((item) => ({
+          path: joinUploadPath(basePath, item.path),
+          file: item.file,
+          targetPath: basePath,
+        }))
+        .sort((left, right) => left.path.localeCompare(right.path, "zh-CN"));
+
+      if (!tasks.length && !directories.length) {
+        setStatus("没有读取到可上传的文件");
+        return;
+      }
+
+      const taskLabel = tasks.length ? `拖拽上传 ${tasks.length} 个文件` : "拖拽创建文件夹";
+      if (!confirmUploadTasks(tasks, taskLabel, { directoryPaths: directories, targetPath: basePath })) {
+        return;
+      }
+
+      await ensureRemoteDirectories(directories);
+      if (!tasks.length) {
+        clearDirectoryCache();
+        await refreshCurrentDirectory({ force: true, silent: true });
+        setStatus(`已创建文件夹，位于：${getDisplayPath(basePath)}`);
+        return;
+      }
+      await runUploadTasks(tasks, taskLabel);
+    }
+
+    document.addEventListener("dragenter", (event) => {
+      if (!isFileDragEvent(event)) {
+        return;
+      }
+      event.preventDefault();
+      dragDepth += 1;
+      updateDragHighlight(resolveDropTarget(event));
+    });
+
+    document.addEventListener("dragover", (event) => {
+      if (!isFileDragEvent(event)) {
+        return;
+      }
+      event.preventDefault();
+      const target = busy ? null : resolveDropTarget(event);
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = target ? "copy" : "none";
+      }
+      updateDragHighlight(target);
+    });
+
+    document.addEventListener("dragleave", (event) => {
+      if (!dropOverlayNode.classList.contains("visible")) {
+        return;
+      }
+      dragDepth -= 1;
+      if (dragDepth <= 0 || event.relatedTarget === null) {
+        clearDragHighlight();
+      }
+    });
+
+    document.addEventListener("drop", (event) => {
+      if (!isFileDragEvent(event)) {
+        return;
+      }
+      event.preventDefault();
+      const target = busy ? null : resolveDropTarget(event);
+      const dropped = collectDropTransfer(event);
+      clearDragHighlight();
+      if (!target) {
+        setStatus("请把文件拖到上传区域或下载区域", true);
+        return;
+      }
+      handleDropUpload(target, dropped).catch((error) => {
+        setStatus(error.message || String(error), true);
+      });
+    });
+
     resetProgress();
     setBusyState(false);
+    followBrowsePath = !!followBrowseCheckNode.checked;
+    overwriteExisting = !!overwriteExistingCheckNode.checked;
     updateUploadTargetView();
     browseTo("", { force: true, silent: true }).catch((error) => {
       setStatus(error.message || String(error), true);
@@ -2411,7 +2817,12 @@ def ensure_directory_path(dir_path: Path) -> tuple[bool, str | None, bool]:
     return True, None, not existed
 
 
-def inspect_upload_state(file_path: Path, incoming_size: int | None = None, incoming_mtime_ms: int | None = None) -> dict[str, Any]:
+def inspect_upload_state(
+    file_path: Path,
+    incoming_size: int | None = None,
+    incoming_mtime_ms: int | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
     if file_path.exists() and file_path.is_dir():
         return {"status": "冲突", "offset": 0, "message": "目标路径已存在同名目录"}
 
@@ -2428,9 +2839,15 @@ def inspect_upload_state(file_path: Path, incoming_size: int | None = None, inco
 
         if incoming_size is not None and incoming_mtime_ms is not None:
             if incoming_size != expected_size or incoming_mtime_ms != expected_mtime:
+                if overwrite:
+                    remove_sidecar(file_path)
+                    return {"status": "覆盖", "offset": 0, "message": "已存在同名文件（残留进度来源不同），将从 0 覆盖"}
                 return {"status": "冲突", "offset": offset, "message": "同名文件的来源信息不匹配，无法续传"}
 
         if offset >= expected_size:
+            if overwrite or expected_size == 0:
+                remove_sidecar(file_path)
+                return {"status": "覆盖", "offset": 0, "message": "服务器上已存在完整文件，将从 0 覆盖"}
             if file_path.exists() and file_path.is_file() and actual_size != expected_size:
                 with file_path.open("r+b") as handle:
                     handle.truncate(expected_size)
@@ -2449,6 +2866,10 @@ def inspect_upload_state(file_path: Path, incoming_size: int | None = None, inco
 
     if file_path.exists():
         if file_path.is_file():
+            if actual_size == 0:
+                return {"status": "覆盖", "offset": 0, "message": "已存在同名空文件，将直接覆盖"}
+            if overwrite:
+                return {"status": "覆盖", "offset": 0, "message": "服务器上已存在同名文件，将从 0 覆盖"}
             return {"status": "跳过", "offset": actual_size, "message": "服务器上已存在完整文件，已跳过"}
         return {"status": "冲突", "offset": 0, "message": "目标路径已存在同名目录"}
 
@@ -4225,6 +4646,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             relative_path = normalize_relative_path(str(payload["path"]))
             size = int(payload["size"])
             mtime_ms = int(payload["mtime_ms"])
+            overwrite = payload.get("overwrite") is True
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
             self.send_json(HTTPStatus.BAD_REQUEST, {"message": "探测请求体格式不正确"})
             return
@@ -4241,7 +4663,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         file_path = resolve_relative_path(self.state.root, relative_path)
         file_lock = self.state.get_file_lock(relative_path)
         with file_lock:
-            result = inspect_upload_state(file_path, size, mtime_ms)
+            result = inspect_upload_state(file_path, size, mtime_ms, overwrite)
         self.send_json(HTTPStatus.OK, result)
 
     def handle_upload(self, query: str) -> None:
@@ -4251,6 +4673,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             file_size = int(self.headers.get("X-File-Size", ""))
             file_mtime = int(self.headers.get("X-File-Mtime", ""))
             content_length = self.get_content_length()
+            overwrite = self.headers.get("X-Overwrite", "").strip().lower() in {"1", "true", "yes", "on"}
         except (ValueError, TypeError):
             self.reject_upload(HTTPStatus.BAD_REQUEST, {"message": "上传请求头不合法"})
             return
@@ -4279,7 +4702,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.reject_upload(HTTPStatus.CONFLICT, {"status": "冲突", "offset": 0, "message": message or "无法创建上级目录"})
                 return
 
-            state = inspect_upload_state(file_path, file_size, file_mtime)
+            state = inspect_upload_state(file_path, file_size, file_mtime, overwrite)
             current_offset = int(state.get("offset", 0))
             if state["status"] == "冲突":
                 self.reject_upload(HTTPStatus.CONFLICT, state)
